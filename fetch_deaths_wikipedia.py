@@ -97,89 +97,232 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     return None
 
 
+def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int) -> Optional[Dict]:
+    """
+    Parse a single death entry line and return a dict or None if invalid.
+    Expected format: * [[Name]], age, description
+    
+    Requirements:
+    - Name must be a wiki link [[Name]] or [[Name|Display Name]]
+    - Age must be present (number after the name)
+    - Description must be present and meaningful
+    """
+    # Strip the leading * or ** 
+    entry_text = re.sub(r'^\*+\s*', '', line)
+    
+    # The entry MUST start with a wiki link (the person's name)
+    if not entry_text.startswith('[['):
+        print(f"  ERROR (line {line_num}): Entry does not start with a wiki link: {line[:80]}...")
+        return None
+    
+    # Extract the first linked name (the person who died)
+    name_match = re.match(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', entry_text)
+    if not name_match:
+        print(f"  ERROR (line {line_num}): Could not parse name link: {line[:80]}...")
+        return None
+    
+    # Article title is always the link target (group 1)
+    article_title = name_match.group(1).strip()
+    
+    # Display name is either the piped text (group 2) or the link target
+    name = name_match.group(2) if name_match.group(2) else article_title
+    name = name.strip()
+    
+    # Skip if it looks like a category, file link, or other special page
+    if ':' in article_title:
+        print(f"  ERROR (line {line_num}): Article title contains colon (special page): {article_title}")
+        return None
+    
+    # Sanity check: name should look like a person's name (not too short, not a generic term)
+    if len(name) < 3:
+        print(f"  ERROR (line {line_num}): Name too short: '{name}'")
+        return None
+    
+    # Get everything after the name link
+    after_name = entry_text[name_match.end():]
+    
+    # Must have content after the name (age, description)
+    if not after_name.strip() or after_name.strip() == ',':
+        print(f"  ERROR (line {line_num}): No content after name: {name}")
+        return None
+    
+    # Check for age - should be a number following the name link
+    # Format: ", 73," or ", 73–74," (age range for uncertain birth year)
+    age_match = re.match(r'\s*,\s*(\d{1,3}(?:[–—-]\d{1,3})?)\s*,', after_name)
+    if not age_match:
+        print(f"  ERROR (line {line_num}): No valid age found for '{name}': {after_name[:50]}...")
+        return None
+    
+    age_str = age_match.group(1)
+    
+    # Sanity check on age - should be reasonable (0-125)
+    try:
+        # Handle age ranges like "94–95"
+        age_parts = re.split(r'[–—-]', age_str)
+        age = int(age_parts[0])
+        if age < 0 or age > 125:
+            print(f"  ERROR (line {line_num}): Unreasonable age {age} for '{name}'")
+            return None
+    except ValueError:
+        print(f"  ERROR (line {line_num}): Could not parse age '{age_str}' for '{name}'")
+        return None
+    
+    # Extract description (everything after the age)
+    description_start = after_name[age_match.end():]
+    
+    # Remove wiki markup: [[link|text]] -> text, [[link]] -> link
+    description = re.sub(r'\[\[([^\]|]+\|)?([^\]]+)\]\]', r'\2', description_start)
+    # Remove HTML tags and refs
+    description = re.sub(r'<[^>]+>', '', description)
+    description = re.sub(r'\{\{[^}]+\}\}', '', description)  # Remove templates
+    # Clean up punctuation and whitespace
+    description = description.strip(' ,;')
+    # Remove date ranges like (1994-2001) or (1994–2001)
+    description = re.sub(r'\(\d{4}[–—-]\d{4}\)', '', description)
+    description = description.strip()
+    
+    # Cut off at first comma or period that's NOT inside parentheses
+    paren_depth = 0
+    cutoff_pos = None
+    for i, char in enumerate(description):
+        if char == '(':
+            paren_depth += 1
+        elif char == ')':
+            paren_depth = max(0, paren_depth - 1)
+        elif char in ',.' and paren_depth == 0:
+            cutoff_pos = i
+            break
+    if cutoff_pos is not None:
+        description = description[:cutoff_pos].strip()
+    
+    # Sanity check: description should be meaningful
+    if not description or len(description) < 3:
+        print(f"  ERROR (line {line_num}): Description too short or empty for '{name}': '{description}'")
+        return None
+    
+    # Description should not be just punctuation or special characters
+    if re.match(r'^[\s\-:;,\.]+$', description):
+        print(f"  ERROR (line {line_num}): Description is just punctuation for '{name}': '{description}'")
+        return None
+    
+    try:
+        death_date = datetime(year, month, current_day)
+        return {
+            'name': name,
+            'article_title': article_title,
+            'death_date': death_date.strftime('%Y-%m-%d'),
+            'description': description
+        }
+    except ValueError:
+        print(f"  ERROR (line {line_num}): Invalid date {year}-{month}-{current_day} for '{name}'")
+        return None
+
+
 def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dict]:
     """
     Parse the wikitext to extract deaths with their dates.
     Wikipedia "Deaths in [Month] [Year]" pages have a consistent format.
     Returns list of dicts with name, article_title, death_date, description.
+    
+    Handles:
+    - Regular entries: * [[Name]], age, description
+    - Group entries with subitems: parent bullet is ignored, subitems are processed
+    - Stops at ==References== section
     """
     deaths = []
     current_day = None
+    errors_count = 0
     
     lines = wikitext.split('\n')
     
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        # Stop at References section
+        if re.match(r'^==+\s*References\s*==+', line, re.IGNORECASE):
+            print(f"  Stopping at References section (line {i+1})")
+            break
+        
+        # Also stop at other end sections like "See also"
+        if re.match(r'^==+\s*(See also|External links|Notes|Further reading)\s*==+', line, re.IGNORECASE):
+            print(f"  Stopping at '{line.strip()}' section (line {i+1})")
+            break
+        
         # Match day headers like "==1==" or "== 1 ==" or "===1==="
         day_match = re.match(r'^==+\s*(\d{1,2})\s*==+', line)
         if day_match:
             current_day = int(day_match.group(1))
+            i += 1
             continue
         
         # Skip if we haven't found a day yet
         if current_day is None:
+            i += 1
             continue
         
-        # Match death entries - they typically start with * and contain [[Name]]
-        # Format is usually: * [[Name]], age, description
-        if line.startswith('*') and '[[' in line:
-            # Extract the first linked name (usually the person who died)
-            name_match = re.search(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', line)
-            if name_match:
-                # Article title is always the link target (group 1)
-                article_title = name_match.group(1).strip()
-                
-                # Display name is either the piped text (group 2) or the link target
-                name = name_match.group(2) if name_match.group(2) else article_title
-                name = name.strip()
-                
-                # Skip if it looks like a category or file link
-                if ':' in article_title:
+        # Check if this is a top-level bullet point (* but not **)
+        if re.match(r'^\*[^\*]', line) and '[[' in line:
+            # Look ahead to see if there are subitems (lines starting with **)
+            has_subitems = False
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                # If next line is a subitem, this entry has subitems
+                if next_line.startswith('**'):
+                    has_subitems = True
+                    break
+                # If next line is a new top-level bullet or section header, no subitems
+                elif next_line.startswith('*') and not next_line.startswith('**'):
+                    break
+                elif next_line.startswith('=='):
+                    break
+                elif next_line.strip() == '':
+                    # Skip empty lines when looking ahead
+                    j += 1
                     continue
-                
-                # Extract description (everything after the name link)
-                # First, get everything after the first ]] 
-                after_name = line.split(']]', 1)[1] if ']]' in line else ''
-                
-                # Remove wiki markup: [[link|text]] -> text, [[link]] -> link
-                description = re.sub(r'\[\[([^\]|]+\|)?([^\]]+)\]\]', r'\2', after_name)
-                # Remove HTML tags and refs
-                description = re.sub(r'<[^>]+>', '', description)
-                description = re.sub(r'\{\{[^}]+\}\}', '', description)  # Remove templates
-                # Clean up punctuation and whitespace
-                description = description.strip(' ,;')
-                # Remove leading age if present (e.g., "73, American politician" or "94–95, British actor")
-                # Handle both single ages and age ranges with various dash types
-                description = re.sub(r'^\d{1,3}(?:[–—-]\d{1,3})?\s*,\s*', '', description)
-                description = description.strip()
-                # Remove date ranges like (1994-2001) or (1994–2001)
-                description = re.sub(r'\(\d{4}[–—-]\d{4}\)', '', description)
-                description = description.strip()
-                # Cut off at first comma or period that's NOT inside parentheses
-                # First, find commas/periods outside parentheses
-                paren_depth = 0
-                cutoff_pos = None
-                for i, char in enumerate(description):
-                    if char == '(':
-                        paren_depth += 1
-                    elif char == ')':
-                        paren_depth = max(0, paren_depth - 1)
-                    elif char in ',.' and paren_depth == 0:
-                        cutoff_pos = i
-                        break
-                if cutoff_pos is not None:
-                    description = description[:cutoff_pos].strip()
-                
-                try:
-                    death_date = datetime(year, month, current_day)
-                    deaths.append({
-                        'name': name,
-                        'article_title': article_title,
-                        'death_date': death_date.strftime('%Y-%m-%d'),
-                        'description': description if description else ""
-                    })
-                except ValueError:
-                    # Invalid date (e.g., Feb 30)
-                    pass
+                else:
+                    # Some other content, stop looking
+                    break
+                j += 1
+            
+            if has_subitems:
+                # Skip this parent entry (it's a group header, not a person)
+                # Process the subitems instead
+                i += 1
+                while i < len(lines) and lines[i].startswith('**'):
+                    subitem_line = lines[i]
+                    death = parse_death_entry(subitem_line, year, month, current_day, i + 1)
+                    if death:
+                        deaths.append(death)
+                    else:
+                        errors_count += 1
+                    i += 1
+                continue
+            else:
+                # Regular entry without subitems
+                death = parse_death_entry(line, year, month, current_day, i + 1)
+                if death:
+                    deaths.append(death)
+                else:
+                    errors_count += 1
+                i += 1
+                continue
+        
+        # Handle standalone subitems (** entries that aren't part of a group we already processed)
+        elif line.startswith('**') and '[[' in line:
+            death = parse_death_entry(line, year, month, current_day, i + 1)
+            if death:
+                deaths.append(death)
+            else:
+                errors_count += 1
+            i += 1
+            continue
+        
+        i += 1
+    
+    if errors_count > 0:
+        print(f"  Encountered {errors_count} entries with format errors (skipped)")
     
     return deaths
 
