@@ -1,0 +1,31 @@
+/.venv
+/analyze_batch.py
+/check_around.py
+/check_liam.py
+/check_new.py
+/cutoff_plot.png
+/cutoff_plot_monthly.png
+/cutoff_plot_pageviews.png
+/CWindowsSystem32cmd.exe.txt
+/deaths_data.csv
+/fetch_deaths_wikipedia.py
+/Geen duidelijke cutoff date zichtbaar voor Claude-Opus-4-5.png
+/jan_2022_0-10_10perday_results.txt
+/jan_2022_0-10_min15000_results.txt
+/MonthChart GPT-5.2.png
+/Old stuff
+/results_claude-opus-4-5_2025-01-01_to_2025-10-31.csv
+/results_claude-opus-4-5_2025-01-01_to_2025-10-31_errors_removed.csv
+/results_gemini-3-flash-preview_2021-09-01_to_2021-10-31.csv
+/results_gemini-3-flash-preview_2024-09-01_to_2025-10-31.csv
+/results_gemini-3-flash-preview_2024-10-16_to_2024-10-16.csv
+/results_gpt-5.2_2025-01-01_to_2025-10-31.csv
+/test_batch_sizes.py
+/test_llm_cutoff.py
+/test_oct15_16.csv
+/test_results_gemini_3_flash.csv
+/top_pageviews.py
+/verify_batch_order.py
+/Verwachte trend niet zichtbaar.png
+/Vrij slechte resultaten voor Claude-Opus-4-5.png
+/__pycache__
