@@ -113,6 +113,10 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     # Remove HTML comments like <!--D-->
     entry_text = re.sub(r'<!--[^>]*-->', '', entry_text)
     
+    # Remove {{circa}} and similar templates that appear before/with ages
+    entry_text = re.sub(r'\{\{circa\}\}\s*', 'c. ', entry_text, flags=re.IGNORECASE)
+    entry_text = re.sub(r'\{\{c\.\}\}\s*', 'c. ', entry_text, flags=re.IGNORECASE)
+    
     # The entry MUST start with a wiki link (the person's name)
     if not entry_text.startswith('[['):
         print(f"  ERROR (line {line_num}): Entry does not start with a wiki link: {line[:80]}...")
@@ -175,6 +179,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     description = description.strip()
     
     # Cut off at first comma or period that's NOT inside parentheses
+    # But don't cut off at "c." (circa) which is used for approximate ages
     paren_depth = 0
     cutoff_pos = None
     for i, char in enumerate(description):
@@ -182,7 +187,13 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
             paren_depth += 1
         elif char == ')':
             paren_depth = max(0, paren_depth - 1)
-        elif char in ',.' and paren_depth == 0:
+        elif char == ',' and paren_depth == 0:
+            cutoff_pos = i
+            break
+        elif char == '.' and paren_depth == 0:
+            # Check if this is "c." (circa) - skip it if so
+            if i > 0 and description[i-1].lower() == 'c' and (i == 1 or not description[i-2].isalpha()):
+                continue
             cutoff_pos = i
             break
     if cutoff_pos is not None:
