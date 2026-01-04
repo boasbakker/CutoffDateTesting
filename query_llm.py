@@ -118,14 +118,14 @@ def select_top_deaths_by_pageviews(
     - min_views: Filter to only deaths with at least this many pageviews
     Deaths should have a 'pageviews' field from the fetch script.
     """
-    if top_per_day and top_per_month:
+    if top_per_day is not None and top_per_month is not None:
         raise ValueError("top_per_day and top_per_month are mutually exclusive")
 
     # First filter by minimum views if specified
     if min_views:
         deaths = [d for d in deaths if int(d.get('pageviews', 0)) >= min_views]
     
-    if top_per_month:
+    if top_per_month is not None:
         deaths_by_month = defaultdict(list)
         for death in deaths:
             month_key = death.get('death_date', '')[:7]
@@ -136,7 +136,7 @@ def select_top_deaths_by_pageviews(
             selected.extend(month_deaths[:top_per_month])
         return selected
 
-    if top_per_day:
+    if top_per_day is not None:
         deaths_by_date = defaultdict(list)
         for death in deaths:
             deaths_by_date[death['death_date']].append(death)
@@ -638,12 +638,12 @@ def main():
         default=None,
         help='Output CSV file for results (default: auto-generated from model and dates)'
     )
-    group = parser.add_mutually_exclusive_group()
+    group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
         '--top-per-day', 
         type=int, 
-        default=5,
-        help='Select top N deaths per day by pageviews (default: 5, use 0 for all)'
+        default=None,
+        help='Select top N deaths per day by pageviews (use 0 for all)'
     )
     group.add_argument(
         '--top-per-month', 
@@ -723,22 +723,34 @@ def main():
         print("No deaths to test!")
         return
     
-    # Generate output filename if not specified
-    if args.output:
-        output_file = args.output
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    selection_label = ""
+    if args.top_per_day is not None:
+        selection_label = f"topday-{args.top_per_day if args.top_per_day > 0 else 'all'}"
+    elif args.top_per_month is not None:
+        selection_label = f"topmonth-{args.top_per_month if args.top_per_month > 0 else 'all'}"
     else:
-        # Build filename from model and date range
+        selection_label = "selection-unknown"
+    min_views_label = f"minviews-{args.min_views}" if args.min_views is not None else "minviews-none"
+    
+    # Generate output filename if not specified (always save inside ./results)
+    if args.output:
+        output_name = os.path.basename(args.output)
+    else:
         model_short = args.model.replace('/', '-').replace(':', '-')
         date_part = ""
         if args.start:
             date_part += f"_{args.start}"
         if args.end:
             date_part += f"_to_{args.end}" if args.start else f"_until_{args.end}"
-        output_file = f"results_{model_short}{date_part}.csv"
+        output_name = f"{model_short}{date_part}_{selection_label}_{min_views_label}.csv"
+    output_file = os.path.join(results_dir, output_name)
     
     # Test the model
-    top_per_day = args.top_per_day if args.top_per_day and args.top_per_day > 0 else None
-    top_per_month = args.top_per_month if args.top_per_month and args.top_per_month > 0 else None
+    top_per_day = args.top_per_day if args.top_per_day is not None and args.top_per_day > 0 else None
+    top_per_month = args.top_per_month if args.top_per_month is not None and args.top_per_month > 0 else None
     min_views = args.min_views
     reasoning = args.reasoning
     
