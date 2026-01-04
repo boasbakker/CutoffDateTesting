@@ -100,12 +100,12 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
 def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int) -> Optional[Dict]:
     """
     Parse a single death entry line and return a dict or None if invalid.
-    Expected format: * [[Name]], age, description
+    Expected format: * [[Name]], age, description  OR  * [[Name]], description (if age unknown)
     
     Requirements:
     - Name must be a wiki link [[Name]] or [[Name|Display Name]]
-    - Age must be present (number after the name)
-    - Description must be present and meaningful
+    - Age is optional (may be unknown)
+    - Description must be present and at least 2 words
     """
     # Strip the leading * or ** 
     entry_text = re.sub(r'^\*+\s*', '', line)
@@ -138,37 +138,27 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         print(f"  ERROR (line {line_num}): Name too short: '{name}'")
         return None
     
+    # Warn if name is just one word (most people have first and last name)
+    if len(name.split()) == 1:
+        print(f"  WARNING (line {line_num}): Name is only one word: '{name}'")
+    
     # Get everything after the name link
     after_name = entry_text[name_match.end():]
     
-    # Must have content after the name (age, description)
+    # Must have content after the name (age and/or description)
     if not after_name.strip() or after_name.strip() == ',':
         print(f"  ERROR (line {line_num}): No content after name: {name}")
         return None
     
-    # Check for age - should be a number following the name link
-    # Format: ", 73," or ", 73–74," (age range for uncertain birth year)
+    # Try to match age - format: ", 73," or ", 73–74," (age range for uncertain birth year)
+    # Age is optional, so we handle both cases
     age_match = re.match(r'\s*,\s*(\d{1,3}(?:[–—-]\d{1,3})?)\s*,', after_name)
-    if not age_match:
-        print(f"  ERROR (line {line_num}): No valid age found for '{name}': {after_name[:50]}...")
-        return None
-    
-    age_str = age_match.group(1)
-    
-    # Sanity check on age - should be reasonable (0-125)
-    try:
-        # Handle age ranges like "94–95"
-        age_parts = re.split(r'[–—-]', age_str)
-        age = int(age_parts[0])
-        if age < 0 or age > 125:
-            print(f"  ERROR (line {line_num}): Unreasonable age {age} for '{name}'")
-            return None
-    except ValueError:
-        print(f"  ERROR (line {line_num}): Could not parse age '{age_str}' for '{name}'")
-        return None
-    
-    # Extract description (everything after the age)
-    description_start = after_name[age_match.end():]
+    if age_match:
+        # Age found - extract description after the age
+        description_start = after_name[age_match.end():]
+    else:
+        # No age - description starts right after the comma following the name
+        description_start = re.sub(r'^\s*,\s*', '', after_name)
     
     # Remove wiki markup: [[link|text]] -> text, [[link]] -> link
     description = re.sub(r'\[\[([^\]|]+\|)?([^\]]+)\]\]', r'\2', description_start)
@@ -195,10 +185,15 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     if cutoff_pos is not None:
         description = description[:cutoff_pos].strip()
     
-    # Sanity check: description should be meaningful
-    if not description or len(description) < 3:
-        print(f"  ERROR (line {line_num}): Description too short or empty for '{name}': '{description}'")
+    # Sanity check: description must be longer than 3 characters
+    if len(description) <= 3:
+        print(f"  ERROR (line {line_num}): Description too short for '{name}': '{description}'")
         return None
+    
+    # Warn if description is only one word
+    words = description.split()
+    if len(words) == 1:
+        print(f"  WARNING (line {line_num}): Description is only one word for '{name}': '{description}'")
     
     # Description should not be just punctuation or special characters
     if re.match(r'^[\s\-:;,\.]+$', description):
