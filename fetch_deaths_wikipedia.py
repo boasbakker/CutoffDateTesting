@@ -110,6 +110,9 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     # Strip the leading * or ** 
     entry_text = re.sub(r'^\*+\s*', '', line)
     
+    # Remove HTML comments like <!--D-->
+    entry_text = re.sub(r'<!--[^>]*-->', '', entry_text)
+    
     # The entry MUST start with a wiki link (the person's name)
     if not entry_text.startswith('[['):
         print(f"  ERROR (line {line_num}): Entry does not start with a wiki link: {line[:80]}...")
