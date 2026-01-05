@@ -1,15 +1,11 @@
-"""
-Monthly-focused processor for LLM test results.
-Loads a results CSV, summarizes per-month accuracy, and produces a compact monthly plot.
-"""
-
 import argparse
 import csv
+import os
+import re
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
-
 
 # =============================================================================
 # Data loading
@@ -18,6 +14,10 @@ import matplotlib.pyplot as plt
 def load_results_from_csv(csv_file: str) -> List[Dict]:
     """Load results data from CSV file and normalize boolean fields."""
     results: List[Dict] = []
+    if not os.path.exists(csv_file):
+        print(f"Error: File {csv_file} not found.")
+        return []
+        
     with open(csv_file, "r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
@@ -63,40 +63,77 @@ def calculate_accuracy_by_month(results: List[Dict]) -> Dict[str, Dict]:
 
     return dict(stats_by_month)
 
+def calculate_moving_average(data: List[float], window_size: int = 3) -> List[float]:
+    """Calculate simple moving average to smooth the trend line."""
+    moving_averages = []
+    for i in range(len(data)):
+        start_idx = max(0, i - window_size + 1)
+        window = data[start_idx : i + 1]
+        moving_averages.append(sum(window) / len(window))
+    return moving_averages
+
+# =============================================================================
+# String Formatting & Parsing
+# =============================================================================
+
+def format_number(num: int) -> str:
+    """Formats large numbers into '500 thousand', '1.5 million', etc."""
+    if num >= 1_000_000:
+        val = num / 1_000_000
+        return f"{val:.1f} million".replace(".0 million", " million")
+    elif num >= 1_000:
+        val = num / 1_000
+        return f"{val:.0f} thousand"
+    return str(num)
+
+def parse_title_info(filename: str) -> Tuple[str, str]:
+    """
+    Parses the filename to extract Model Name and View count.
+    Input: gpt-5.2_2020-01-01_to_2025-12-31_topmonth-100_minviews-500000.csv
+    Returns: ("GPT 5.2", "All deaths with minimum 500 thousand views")
+    """
+    base = os.path.basename(filename)
+    
+    # 1. Extract Model Name (everything before the first underscore)
+    parts = base.split('_')
+    raw_model = parts[0]
+    
+    # Capitalize logic: "gpt-5.2" -> "GPT 5.2"
+    if "gpt" in raw_model.lower():
+        model_name = raw_model.upper().replace("-", " ")
+    else:
+        # Fallback for other models: capitalize first letter
+        model_name = raw_model.replace("-", " ").title()
+
+    # 2. Extract Min Views using Regex
+    views_match = re.search(r"minviews-(\d+)", base)
+    subtitle = ""
+    if views_match:
+        views_count = int(views_match.group(1))
+        readable_views = format_number(views_count)
+        subtitle = f"All deaths with minimum {readable_views} views"
+    else:
+        subtitle = "Knowledge of deaths by month"
+
+    return model_name, subtitle
 
 # =============================================================================
 # Reporting
 # =============================================================================
 
 def print_summary(results: List[Dict], stats_by_month: Dict[str, Dict], min_samples: int) -> None:
-    """Print overall and per-month summaries."""
+    total = len(results)
+    if total == 0: return
+
     total_correct = sum(1 for r in results if r["llm_knows_death"] is True)
     total_incorrect = sum(1 for r in results if r["llm_knows_death"] is False)
-    total_unknown = sum(1 for r in results if r["llm_knows_death"] is None)
-
-    total = len(results)
+    
     print("\n" + "=" * 60)
     print("Overall")
     print("=" * 60)
     print(f"Total tested: {total}")
     print(f"  Knows death: {total_correct} ({total_correct/total*100:.1f}%)")
     print(f"  Doesn't know: {total_incorrect} ({total_incorrect/total*100:.1f}%)")
-    if total_unknown:
-        print(f"  Errors: {total_unknown} ({total_unknown/total*100:.1f}%)")
-
-    print("\nPer month (known >= {min_samples}):")
-    header = f"{'Month':<10}{'Accuracy':>10}{'Known':>10}{'Total':>10}"
-    print(header)
-    print("-" * len(header))
-
-    for month in sorted(stats_by_month.keys()):
-        stats = stats_by_month[month]
-        known_total = stats["correct"] + stats["incorrect"]
-        if stats["accuracy"] is None or known_total < min_samples:
-            continue
-        acc_str = f"{stats['accuracy']:.1f}%" if stats["accuracy"] is not None else "N/A"
-        print(f"{month:<10}{acc_str:>10}{known_total:>10}{stats['total']:>10}")
-
 
 # =============================================================================
 # Plotting
@@ -104,14 +141,14 @@ def print_summary(results: List[Dict], stats_by_month: Dict[str, Dict], min_samp
 
 def plot_monthly_accuracy(
     stats_by_month: Dict[str, Dict],
-    model: str,
+    input_filename: str,
     output_file: str,
     min_samples: int,
 ) -> None:
-    """Plot monthly accuracy without per-bar labels so many months fit."""
     months: List[str] = []
     accuracies: List[float] = []
 
+    # Sort and filter data
     for month in sorted(stats_by_month.keys()):
         stats = stats_by_month[month]
         known_total = stats["correct"] + stats["incorrect"]
@@ -124,31 +161,42 @@ def plot_monthly_accuracy(
         print("No monthly data meets the sample threshold; plot skipped.")
         return
 
-    # Expand width slightly as months grow; keeps labels readable.
-    fig_width = max(12, len(months) * 0.35)
-    fig, ax = plt.subplots(figsize=(fig_width, 6))
+    # Calculate Moving Average (Window size 3 months)
+    moving_avg = calculate_moving_average(accuracies, window_size=3)
 
-    ax.bar(range(len(months)), accuracies, color="#4d7fcd", edgecolor="#1f3f75", width=0.8)
-    ax.set_xticks(range(len(months)))
-    ax.set_xticklabels(months, rotation=60, ha="right")
+    # Determine figure width based on data points
+    fig_width = max(14, len(months) * 0.25)
+    fig, ax = plt.subplots(figsize=(fig_width, 7))
 
-    ax.set_ylabel("Accuracy (%)", fontsize=11)
-    ax.set_xlabel("Death month (YYYY-MM)", fontsize=11)
-    ax.set_title(f"{model} knowledge of deaths by month", fontsize=13)
+    # Set background color for better contrast
+    ax.set_facecolor('#f8f9fa')
 
+    # 1. Plot Bars
+    bars = ax.bar(range(len(months)), accuracies, color="#4d7fcd", edgecolor="#3b5b95", width=0.8, label="Monthly Accuracy", zorder=2)
+    
+    # 2. Plot Moving Average Line
+    ax.plot(range(len(months)), moving_avg, color="#d9534f", linewidth=2.5, marker='o', markersize=3, label="3-Month Moving Avg", zorder=3)
+
+    # 3. Handle X-Axis Labels (Show every 3rd label to prevent crowding)
+    tick_step = 3
+    ax.set_xticks(range(0, len(months), tick_step))
+    ax.set_xticklabels([months[i] for i in range(0, len(months), tick_step)], rotation=45, ha="right", fontsize=10)
+
+    # 4. Generate Dynamic Titles
+    model_name, subtitle = parse_title_info(input_filename)
+    
+    plt.title(f"{model_name}\n{subtitle}", fontsize=16, fontweight='bold', pad=20)
+    
+    ax.set_ylabel("Accuracy (%)", fontsize=12)
+    ax.set_xlabel("Death month", fontsize=12)
+
+    # 5. Grid and Limits
     ax.set_ylim(0, 105)
-    ax.axhline(50, color="gray", linestyle="--", linewidth=1, alpha=0.5)
-    ax.grid(True, axis="y", alpha=0.35)
+    ax.axhline(50, color="gray", linestyle="--", linewidth=1.5, alpha=0.6, zorder=1)
+    ax.grid(True, axis="y", alpha=0.3, zorder=0)
 
-    ax.text(
-        0.01,
-        0.97,
-        f"Months with at least {min_samples} known samples",
-        transform=ax.transAxes,
-        fontsize=9,
-        va="top",
-        alpha=0.75,
-    )
+    # 6. Legend
+    ax.legend(loc="lower left", frameon=True, facecolor="white", framealpha=1)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=160)
@@ -167,19 +215,13 @@ def parse_args() -> argparse.Namespace:
         "--input",
         type=str,
         default="test_results.csv",
-        help="Input CSV file with test results (default: test_results.csv)",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="LLM",
-        help="Model name used for plot titles (default: LLM)",
+        help="Input CSV file with test results",
     )
     parser.add_argument(
         "--plot",
         type=str,
         default="cutoff_plot_monthly.png",
-        help="Output PNG for the monthly plot (default: cutoff_plot_monthly.png)",
+        help="Output PNG for the monthly plot",
     )
     parser.add_argument(
         "--min-samples",
@@ -203,7 +245,6 @@ def main() -> None:
     print(f"Loaded {len(results)} rows")
 
     if not results:
-        print("No results to analyze; exiting.")
         return
 
     stats_by_month = calculate_accuracy_by_month(results)
@@ -211,7 +252,8 @@ def main() -> None:
     print_summary(results, stats_by_month, args.min_samples)
 
     if not args.no_plot:
-        plot_monthly_accuracy(stats_by_month, args.model, args.plot, args.min_samples)
+        # Note: We pass args.input (the filename) instead of args.model now
+        plot_monthly_accuracy(stats_by_month, args.input, args.plot, args.min_samples)
 
 
 if __name__ == "__main__":

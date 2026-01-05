@@ -43,7 +43,7 @@ PROMPT_TEMPLATE = 'Is {name}, {description}, still alive?'
 
 # Default models
 DEFAULT_MODEL_OPENAI = "gpt-5.2"
-DEFAULT_MODEL_GEMINI = "gemini-3.0-flash"
+DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
 DEFAULT_MODEL_CLAUDE = "claude-opus-4-5-20250929"
 
 
@@ -460,15 +460,19 @@ def test_deaths_batch_gemini(
     reasoning: bool = False
 ) -> List[Dict]:
     """
-    Test Gemini's knowledge of deaths using the Batch API.
+    Test Gemini's knowledge of deaths using the Batch API with file-based input.
+    Uses JSONL file with keys to reliably match responses to requests.
     Submits all requests at once and waits for completion.
     Always returns results (never exits on error for batch).
     """
+    import json
+    import tempfile
+    
     client = genai.Client(api_key=os.environ.get('GOOGLE_API_KEY'))
     deaths = select_top_deaths_by_pageviews(deaths, top_per_day, top_per_month, min_views)
     
     total = len(deaths)
-    print(f"Testing {total} deaths with model: {model_name} (using Batch API)")
+    print(f"Testing {total} deaths with model: {model_name} (using Batch API with file input)")
     print("=" * 50)
     
     # Determine thinking level based on model and reasoning flag
@@ -487,7 +491,7 @@ def test_deaths_batch_gemini(
     
     temperature = 1 if reasoning else TEMPERATURE
     
-    # Build inline requests for Gemini Batch API
+    # Build requests for Gemini Batch API using file-based input with keys
     system_prompt = SYSTEM_PROMPT_REASONING if reasoning else SYSTEM_PROMPT
     
     debug_print_settings("Gemini", {
@@ -499,28 +503,47 @@ def test_deaths_batch_gemini(
         'prompt_template': PROMPT_TEMPLATE
     })
     
-    inline_requests = []
-    for i, death in enumerate(deaths):
-        prompt = PROMPT_TEMPLATE.format(name=death['name'], description=death.get('description', ''))
-        inline_requests.append({
-            'contents': [{
-                'parts': [{'text': prompt}],
-                'role': 'user'
-            }],
-            'config': {
-                'system_instruction': {'parts': [{'text': system_prompt}]},
-                'temperature': float(temperature),
-                'max_output_tokens': max_tokens,
-                'thinking_config': {'thinking_level': thinking_level}
-            }
-        })
-        if i == 0:
-            debug_print(f"Sample request (first): {inline_requests[0]}")
+    # Create JSONL file with keyed requests for reliable matching
+    # Each line: {"key": "request-N", "request": {...}}
+    jsonl_file_path = tempfile.mktemp(suffix='.jsonl', prefix='gemini_batch_')
     
-    print(f"Submitting batch of {len(inline_requests)} requests (thinking_level={thinking_level})...")
+    with open(jsonl_file_path, 'w', encoding='utf-8') as f:
+        for i, death in enumerate(deaths):
+            prompt = PROMPT_TEMPLATE.format(name=death['name'], description=death.get('description', ''))
+            request_obj = {
+                "key": f"request-{i}",
+                "request": {
+                    "contents": [{
+                        "parts": [{"text": prompt}],
+                        "role": "user"
+                    }],
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "generationConfig": {
+                        "temperature": float(temperature),
+                        "maxOutputTokens": max_tokens,
+                        "thinkingConfig": {"thinkingLevel": thinking_level.upper()}
+                    }
+                }
+            }
+            f.write(json.dumps(request_obj) + '\n')
+            if i == 0:
+                debug_print(f"Sample request (first): {request_obj}")
+    
+    print(f"Created JSONL file with {total} requests: {jsonl_file_path}")
+    
+    # Upload the file
+    print("Uploading batch request file...")
+    uploaded_file = client.files.upload(
+        file=jsonl_file_path,
+        config={'display_name': f'cutoff-test-{model_name}', 'mime_type': 'application/jsonl'}
+    )
+    print(f"Uploaded file: {uploaded_file.name}")
+    
+    # Create batch job using the uploaded file
+    print(f"Submitting batch job (thinking_level={thinking_level})...")
     batch_job = client.batches.create(
         model=model_name,
-        src=inline_requests,
+        src=uploaded_file.name,
         config={'display_name': f'cutoff-test-{model_name}'}
     )
     job_name = batch_job.name
@@ -542,25 +565,76 @@ def test_deaths_batch_gemini(
     if batch_job.state.name != 'JOB_STATE_SUCCEEDED':
         print(f"Warning: Batch job ended with state: {batch_job.state.name}")
     
-    # Retrieve results - handle errors gracefully
-    # WARNING: For inline requests, there's no custom_id. We assume responses are in same order as requests.
-    # This may not be guaranteed by the API - consider using file-based approach with keys for reliability.
+    # Retrieve results from file - parse JSONL with keys for reliable matching
     print("Retrieving results...")
     result_map = {}
-    if batch_job.dest and batch_job.dest.inlined_responses:
+    
+    if batch_job.dest and batch_job.dest.file_name:
+        # Download and parse the result file
+        result_file_name = batch_job.dest.file_name
+        print(f"Downloading results from: {result_file_name}")
+        
+        file_content_bytes = client.files.download(file=result_file_name)
+        file_content = file_content_bytes.decode('utf-8')
+        
+        for line in file_content.splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed_response = json.loads(line)
+                # Extract key (e.g., "request-0") to get index
+                key = parsed_response.get('key', '')
+                if key.startswith('request-'):
+                    idx = int(key.split('-')[1])
+                else:
+                    debug_print(f"Unexpected key format: {key}")
+                    continue
+                
+                if 'response' in parsed_response and parsed_response['response']:
+                    # Extract text from response
+                    try:
+                        candidates = parsed_response['response'].get('candidates', [])
+                        if candidates:
+                            parts = candidates[0].get('content', {}).get('parts', [])
+                            answer = ''
+                            for part in parts:
+                                if 'text' in part:
+                                    answer = part['text'].strip()
+                                    break
+                            
+                            knows_death, error = parse_yes_no_response_safe(answer)
+                            if error:
+                                result_map[str(idx)] = (None, f"{answer} (parse error: {error})")
+                            else:
+                                result_map[str(idx)] = (knows_death, answer)
+                        else:
+                            result_map[str(idx)] = (None, "Error: No candidates in response")
+                    except Exception as e:
+                        result_map[str(idx)] = (None, f"Error parsing response: {e}")
+                elif 'error' in parsed_response:
+                    result_map[str(idx)] = (None, f"Error: {parsed_response['error']}")
+                else:
+                    result_map[str(idx)] = (None, "Error: No response or error in result")
+                    
+            except json.JSONDecodeError as e:
+                debug_print(f"Failed to parse line: {line[:100]}... Error: {e}")
+        
+        # Clean up: delete the uploaded file (optional)
+        try:
+            client.files.delete(name=uploaded_file.name)
+            debug_print(f"Deleted uploaded file: {uploaded_file.name}")
+        except Exception as e:
+            debug_print(f"Failed to delete uploaded file: {e}")
+    
+    elif batch_job.dest and batch_job.dest.inlined_responses:
+        # Fallback to inline responses (should not happen with file input)
+        print("Warning: Got inlined responses instead of file output")
         num_responses = len(batch_job.dest.inlined_responses)
-        num_requests = len(inline_requests)
+        num_requests = total
         if num_responses != num_requests:
             print(f"WARNING: Response count ({num_responses}) != Request count ({num_requests})")
         
         for i, inline_response in enumerate(batch_job.dest.inlined_responses):
-            # Debug: show what we got and what we expected
-            if DEBUG and i < len(deaths):
-                expected_name = deaths[i]['name']
-                debug_print(f"Result {i} (expected: {expected_name}): {inline_response}")
-            else:
-                debug_print(f"Result {i}: {inline_response}")
-            
             if inline_response.response:
                 try:
                     answer = inline_response.response.text.strip()
@@ -575,6 +649,13 @@ def test_deaths_batch_gemini(
                 result_map[str(i)] = (None, f"Error: {inline_response.error}")
             else:
                 result_map[str(i)] = (None, "Error: No response")
+    
+    # Clean up local temp file
+    try:
+        os.remove(jsonl_file_path)
+        debug_print(f"Deleted local temp file: {jsonl_file_path}")
+    except Exception as e:
+        debug_print(f"Failed to delete temp file: {e}")
     
     return process_batch_results(deaths, result_map, total)
 
