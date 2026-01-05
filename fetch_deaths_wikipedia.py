@@ -252,6 +252,9 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     # Remove HTML comments like <!--D-->
     entry_text = re.sub(r'<!--[^>]*-->', '', entry_text)
     
+    # Remove external links in format [https://...] or [http://...]
+    entry_text = re.sub(r'\[https?://[^\]]*\]', '', entry_text)
+    
     # Check for {{ill|Name|lang}} template (interlanguage link - no English article)
     ill_match = re.match(r'\{\{ill\|([^|\}]+)\|([^|\}]+)', entry_text)
     if ill_match:
