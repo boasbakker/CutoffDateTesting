@@ -97,7 +97,7 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     return None
 
 
-def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int) -> Optional[Dict]:
+def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, parent_item: Optional[str] = None) -> Optional[Dict]:
     """
     Parse a single death entry line and return a dict or None if invalid.
     Expected format: * [[Name]], age, description  OR  * [[Name]], description (if age unknown)
@@ -106,7 +106,131 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     - Name must be a wiki link [[Name]] or [[Name|Display Name]]
     - Age is optional (may be unknown)
     - Description must be present and at least 2 words
+    
+    Args:
+        parent_item: If this is a subitem, the text of the parent bullet point
     """
+    # Helper to format error/warning prefix with optional parent context
+    def msg_prefix():
+        if parent_item:
+            return f"  {{}} (line {line_num}, under: {parent_item[:60]}...): "
+        return f"  {{}} (line {line_num}): "
+    
+    def extract_nationality_from_parent(parent: str) -> Optional[str]:
+        """
+        Try to extract nationality/description from parent item.
+        Patterns like:
+        - Notable Brazilians who died in the...
+        - Chinese marathon runners killed in the...
+        - Notable Americans killed in the...
+        - Chinese marathon runner killed in the... (singular - use full description)
+        """
+        if not parent:
+            return None
+        
+        # First, try to match singular form (full description like "Chinese marathon runner")
+        # Pattern: (Nationality + role in singular) (killed|who died) in the
+        singular_match = re.search(
+            r'(?:Notable\s+)?([A-Z][a-z]+(?:[-\s][a-z]+)+)\s+(?:killed|who\s+died)\s+in\s+the',
+            parent,
+            re.IGNORECASE
+        )
+        if singular_match:
+            description = singular_match.group(1).strip()
+            # Check it's not a plural nationality (ends with 's' followed by nothing or space before killed/died)
+            # If it doesn't end with 's', it's likely a full description like "Chinese marathon runner"
+            if not description.endswith('s'):
+                return description
+        
+        # Pattern: (Notable)? (Nationality ending in 's' OR Nationality + role) (killed|who died) in the
+        # Examples: "Notable Brazilians who died", "Chinese marathon runners killed", "Notable Americans killed"
+        match = re.search(
+            r'(?:Notable\s+)?([A-Z][a-z]+(?:[-\s][A-Z]?[a-z]+)*s)(?:\s+[a-z]+(?:\s+[a-z]+)*)?\s+(?:killed|who\s+died)\s+in\s+the',
+            parent,
+            re.IGNORECASE
+        )
+        if match:
+            # Extract the nationality (e.g., "Brazilians" -> "Brazilian")
+            nationality_plural = match.group(1)
+            # Convert plural nationality to singular adjective
+            if nationality_plural.lower().endswith('s'):
+                nationality = nationality_plural[:-1]  # Remove trailing 's'
+            else:
+                nationality = nationality_plural
+            return nationality
+        return None
+    
+    def handle_error(error_msg: str, parsed_name: Optional[str] = None, parsed_description: Optional[str] = None) -> Optional[Dict]:
+        """Handle an error by prompting user for input."""
+        print(msg_prefix().format('ERROR') + error_msg)
+        print(f"  Full line: {line}")
+        if parent_item:
+            print(f"  Parent: {parent_item}")
+        
+        skip = input("  Skip this person? (y/n, Enter=n): ").strip().lower()
+        if skip == 'y':
+            return None
+        
+        # Get name from user (suggest parsed name if available)
+        if parsed_name:
+            user_name = input(f"  Enter name (press Enter to keep '{parsed_name}'): ").strip()
+            if not user_name:
+                user_name = parsed_name
+        else:
+            user_name = input("  Enter name: ").strip()
+        
+        if not user_name:
+            print("  No name provided, skipping.")
+            return None
+        
+        # Try to build description from parent item for subitems with one-word descriptions
+        suggested_description = parsed_description
+        if parsed_description and len(parsed_description.split()) == 1 and parent_item:
+            extracted = extract_nationality_from_parent(parent_item)
+            if extracted:
+                # Check if extracted is a full description (multiple words) or just nationality
+                if len(extracted.split()) > 1:
+                    # Full description like "Chinese marathon runner"
+                    suggested_description = extracted
+                else:
+                    # Just nationality, combine with parsed description
+                    suggested_description = f"{extracted} {parsed_description}"
+                confirm = input(f"  Detected description: '{suggested_description}'. Correct? (y/n, Enter=y): ").strip().lower()
+                if confirm == '' or confirm == 'y':
+                    user_description = suggested_description
+                else:
+                    user_description = input("  Enter description: ").strip()
+            else:
+                # No nationality detected, ask for description
+                if parsed_description:
+                    user_description = input(f"  Enter description (press Enter to keep '{parsed_description}'): ").strip()
+                    if not user_description:
+                        user_description = parsed_description
+                else:
+                    user_description = input("  Enter description: ").strip()
+        elif parsed_description:
+            user_description = input(f"  Enter description (press Enter to keep '{parsed_description}'): ").strip()
+            if not user_description:
+                user_description = parsed_description
+        else:
+            user_description = input("  Enter description: ").strip()
+        
+        if not user_description:
+            print("  No description provided, skipping.")
+            return None
+        
+        try:
+            death_date = datetime(year, month, current_day)
+            return {
+                'name': user_name,
+                'article_title': user_name,  # Use name as article title for manual entries
+                'death_date': death_date.strftime('%Y-%m-%d'),
+                'description': user_description
+            }
+        except ValueError:
+            print(f"  Invalid date {year}-{month}-{current_day}, skipping.")
+            return None
+
     # Strip the leading * or ** 
     entry_text = re.sub(r'^\*+\s*', '', line)
     
@@ -119,14 +243,12 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     
     # The entry MUST start with a wiki link (the person's name)
     if not entry_text.startswith('[['):
-        print(f"  ERROR (line {line_num}): Entry does not start with a wiki link: {line[:80]}...")
-        return None
+        return handle_error(f"Entry does not start with a wiki link: {line[:80]}...")
     
     # Extract the first linked name (the person who died)
     name_match = re.match(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]', entry_text)
     if not name_match:
-        print(f"  ERROR (line {line_num}): Could not parse name link: {line[:80]}...")
-        return None
+        return handle_error(f"Could not parse name link: {line[:80]}...")
     
     # Article title is always the link target (group 1)
     article_title = name_match.group(1).strip()
@@ -135,84 +257,93 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     name = name_match.group(2) if name_match.group(2) else article_title
     name = name.strip()
     
-    # Skip if it looks like a category, file link, or other special page
-    if ':' in article_title:
-        print(f"  ERROR (line {line_num}): Article title contains colon (special page): {article_title}")
-        return None
-    
-    # Sanity check: name should look like a person's name (not too short, not a generic term)
-    if len(name) < 3:
-        print(f"  ERROR (line {line_num}): Name too short: '{name}'")
-        return None
-    
-    # Warn if name is just one word (most people have first and last name)
-    if len(name.split()) == 1:
-        print(f"  WARNING (line {line_num}): Name is only one word: '{name}'")
-    
     # Get everything after the name link
     after_name = entry_text[name_match.end():]
     
+    # Parse description first so it's available for error handling
+    description = None
+    if after_name.strip() and after_name.strip() != ',':
+        # Try to match age - format: ", 73," or ", 73–74," (age range) or ", 60s," (decade)
+        # Age is optional, so we handle both cases
+        age_match = re.match(r'\s*,\s*(\d{1,3}(?:[–—-]\d{1,3})?s?)\s*,', after_name)
+        if age_match:
+            # Age found - extract description after the age
+            description_start = after_name[age_match.end():]
+        else:
+            # No age - description starts right after the comma following the name
+            description_start = re.sub(r'^\s*,\s*', '', after_name)
+        
+        # Remove wiki markup: [[link|text]] -> text, [[link]] -> link
+        description = re.sub(r'\[\[([^\]|]+\|)?([^\]]+)\]\]', r'\2', description_start)
+        # Remove HTML tags and refs
+        description = re.sub(r'<[^>]+>', '', description)
+        description = re.sub(r'\{\{[^}]+\}\}', '', description)  # Remove templates
+        # Clean up punctuation and whitespace
+        description = description.strip(' ,;')
+        # Remove date ranges like (1994-2001) or (1994–2001)
+        description = re.sub(r'\(\d{4}[–—-]\d{4}\)', '', description)
+        description = description.strip()
+        
+        # Cut off at first comma or period that's NOT inside parentheses
+        # But don't cut off at "c." (circa) which is used for approximate ages
+        paren_depth = 0
+        cutoff_pos = None
+        for i, char in enumerate(description):
+            if char == '(':
+                paren_depth += 1
+            elif char == ')':
+                paren_depth = max(0, paren_depth - 1)
+            elif char == ',' and paren_depth == 0:
+                cutoff_pos = i
+                break
+            elif char == '.' and paren_depth == 0:
+                # Check if this is "c." (circa) - skip it if so
+                if i > 0 and description[i-1].lower() == 'c' and (i == 1 or not description[i-2].isalpha()):
+                    continue
+                cutoff_pos = i
+                break
+        if cutoff_pos is not None:
+            description = description[:cutoff_pos].strip()
+    
+    # Now do name validation checks (with description available for defaults)
+    
+    # Skip if it looks like a category, file link, or other special page
+    if ':' in article_title:
+        return handle_error(f"Article title contains colon (special page): {article_title}", name, description)
+    
+    # Sanity check: name should look like a person's name (not too short, not a generic term)
+    if len(name) < 2:
+        return handle_error(f"Name too short: '{name}'", name, description)
+    
+    # Two letter names are allowed if they are a capital letter followed by a lowercase letter
+    if len(name) == 2:
+        if re.match(r'^[A-Z][a-z]$', name):
+            print(msg_prefix().format('WARNING') + f"Name is only 2 characters: '{name}'")
+        else:
+            return handle_error(f"Invalid 2-character name (must be capital + lowercase): '{name}'", name, description)
+    
+    # Warn if name is just one word (most people have first and last name)
+    if len(name.split()) == 1:
+        print(msg_prefix().format('WARNING') + f"Name is only one word: '{name}'")
+    
+    # Now validate description
+    
     # Must have content after the name (age and/or description)
     if not after_name.strip() or after_name.strip() == ',':
-        print(f"  ERROR (line {line_num}): No content after name: {name}")
-        return None
-    
-    # Try to match age - format: ", 73," or ", 73–74," (age range for uncertain birth year)
-    # Age is optional, so we handle both cases
-    age_match = re.match(r'\s*,\s*(\d{1,3}(?:[–—-]\d{1,3})?)\s*,', after_name)
-    if age_match:
-        # Age found - extract description after the age
-        description_start = after_name[age_match.end():]
-    else:
-        # No age - description starts right after the comma following the name
-        description_start = re.sub(r'^\s*,\s*', '', after_name)
-    
-    # Remove wiki markup: [[link|text]] -> text, [[link]] -> link
-    description = re.sub(r'\[\[([^\]|]+\|)?([^\]]+)\]\]', r'\2', description_start)
-    # Remove HTML tags and refs
-    description = re.sub(r'<[^>]+>', '', description)
-    description = re.sub(r'\{\{[^}]+\}\}', '', description)  # Remove templates
-    # Clean up punctuation and whitespace
-    description = description.strip(' ,;')
-    # Remove date ranges like (1994-2001) or (1994–2001)
-    description = re.sub(r'\(\d{4}[–—-]\d{4}\)', '', description)
-    description = description.strip()
-    
-    # Cut off at first comma or period that's NOT inside parentheses
-    # But don't cut off at "c." (circa) which is used for approximate ages
-    paren_depth = 0
-    cutoff_pos = None
-    for i, char in enumerate(description):
-        if char == '(':
-            paren_depth += 1
-        elif char == ')':
-            paren_depth = max(0, paren_depth - 1)
-        elif char == ',' and paren_depth == 0:
-            cutoff_pos = i
-            break
-        elif char == '.' and paren_depth == 0:
-            # Check if this is "c." (circa) - skip it if so
-            if i > 0 and description[i-1].lower() == 'c' and (i == 1 or not description[i-2].isalpha()):
-                continue
-            cutoff_pos = i
-            break
-    if cutoff_pos is not None:
-        description = description[:cutoff_pos].strip()
+        return handle_error(f"No content after name: {name}", name, description)
     
     # Sanity check: description must be longer than 3 characters
-    if len(description) <= 3:
-        print(f"  ERROR (line {line_num}): Description too short for '{name}': '{description}'")
-        return None
+    if not description or len(description) <= 3:
+        return handle_error(f"Description too short for '{name}': '{description}'", name, description)
     
-    # Warn if description is only one word
+    # Description must have at least 2 words
     words = description.split()
     if len(words) == 1:
-        print(f"  WARNING (line {line_num}): Description is only one word for '{name}': '{description}'")
+        return handle_error(f"Description is only one word for '{name}': '{description}'", name, description)
     
     # Description should not be just punctuation or special characters
     if re.match(r'^[\s\-:;,\.]+$', description):
-        print(f"  ERROR (line {line_num}): Description is just punctuation for '{name}': '{description}'")
-        return None
+        return handle_error(f"Description is just punctuation for '{name}': '{description}'", name, description)
     
     try:
         death_date = datetime(year, month, current_day)
@@ -223,7 +354,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
             'description': description
         }
     except ValueError:
-        print(f"  ERROR (line {line_num}): Invalid date {year}-{month}-{current_day} for '{name}'")
+        print(msg_prefix().format('ERROR') + f"Invalid date {year}-{month}-{current_day} for '{name}'")
         return None
 
 
@@ -271,7 +402,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dic
             continue
         
         # Check if this is a top-level bullet point (* but not **)
-        if re.match(r'^\*[^\*]', line) and '[[' in line:
+        if re.match(r'^\*[^\*]', line):
             # Look ahead to see if there are subitems (lines starting with **)
             has_subitems = False
             j = i + 1
@@ -298,23 +429,27 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dic
             if has_subitems:
                 # Skip this parent entry (it's a group header, not a person)
                 # Process the subitems instead
+                parent_text = line.strip()
                 i += 1
                 while i < len(lines) and lines[i].startswith('**'):
                     subitem_line = lines[i]
-                    death = parse_death_entry(subitem_line, year, month, current_day, i + 1)
+                    # Only process subitems that have wiki links (actual people)
+                    if '[[' in subitem_line:
+                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, parent_item=parent_text)
+                        if death:
+                            deaths.append(death)
+                        else:
+                            errors_count += 1
+                    i += 1
+                continue
+            else:
+                # Regular entry without subitems - only process if it has a wiki link
+                if '[[' in line:
+                    death = parse_death_entry(line, year, month, current_day, i + 1)
                     if death:
                         deaths.append(death)
                     else:
                         errors_count += 1
-                    i += 1
-                continue
-            else:
-                # Regular entry without subitems
-                death = parse_death_entry(line, year, month, current_day, i + 1)
-                if death:
-                    deaths.append(death)
-                else:
-                    errors_count += 1
                 i += 1
                 continue
         
