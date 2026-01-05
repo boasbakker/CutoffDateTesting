@@ -27,6 +27,7 @@ def get_pageviews_sum(article_title: str, death_date: datetime) -> int:
     """
     Get total pageviews for an article from 1 day before death up to 60 days after.
     Uses Wikimedia Pageviews REST API.
+    Returns -1 if the page doesn't exist (404).
     """
     # Pageviews API expects underscores instead of spaces
     safe_title = article_title.replace(' ', '_')
@@ -39,7 +40,7 @@ def get_pageviews_sum(article_title: str, death_date: datetime) -> int:
     )
     resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
     if resp.status_code == 404:
-        return 0  # Page not found or no views
+        return -1  # Page not found - article doesn't exist
     resp.raise_for_status()
     data = resp.json()
     return sum(item.get('views', 0) for item in data.get('items', []))
@@ -250,6 +251,14 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     
     # Remove HTML comments like <!--D-->
     entry_text = re.sub(r'<!--[^>]*-->', '', entry_text)
+    
+    # Check for {{ill|Name|lang}} template (interlanguage link - no English article)
+    ill_match = re.match(r'\{\{ill\|([^|\}]+)\|([^|\}]+)', entry_text)
+    if ill_match:
+        name = ill_match.group(1).strip()
+        lang = ill_match.group(2).strip()
+        print(msg_prefix().format('WARNING') + f"Skipping '{name}' - no English article (only {lang} Wikipedia)")
+        return None
     
     # Remove {{circa}} and similar templates that appear before/with ages
     entry_text = re.sub(r'\{\{circa\}\}\s*', 'c. ', entry_text, flags=re.IGNORECASE)
@@ -593,12 +602,23 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             pageview_counts = get_pageviews_for_articles(all_article_entries)
 
             # Add pageview count to each death record and collect all
+            # Skip entries where article doesn't exist (pageviews == -1)
+            skipped_no_article = 0
             for day_key in sorted(deaths_by_day.keys()):
                 for death in deaths_by_day[day_key]:
-                    death['pageviews'] = pageview_counts.get(death['article_title'], 0)
+                    views = pageview_counts.get(death['article_title'], 0)
+                    if views == -1:
+                        # Article doesn't exist in English Wikipedia
+                        print(f"  WARNING: Skipping '{death['name']}' - no English Wikipedia article")
+                        skipped_no_article += 1
+                        continue
+                    death['pageviews'] = views
                     death.pop('article_title', None)  # Remove helper field
                     month_deaths.append(death)
                     all_deaths.append(death)
+            
+            if skipped_no_article > 0:
+                print(f"  Skipped {skipped_no_article} entries with no English Wikipedia article")
         
         # Write this month's deaths to CSV immediately
         if month_deaths:
