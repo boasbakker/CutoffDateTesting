@@ -8,10 +8,14 @@ import requests
 import re
 import csv
 import time
+import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Script version - increment this when making changes to force new output file
+SCRIPT_VERSION = "1.0"
 
 # Global headers for Wikipedia API requests
 WIKI_HEADERS = {
@@ -124,9 +128,19 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         - Chinese marathon runners killed in the...
         - Notable Americans killed in the...
         - Chinese marathon runner killed in the... (singular - use full description)
+        - Israeli people killed in the 7 October attacks...
         """
         if not parent:
             return None
+        
+        # Pattern for "Nationality people killed in" (e.g., "Israeli people killed in the 7 October attacks")
+        people_match = re.search(
+            r'([A-Z][a-z]+)\s+people\s+(?:killed|who\s+died)\s+in',
+            parent,
+            re.IGNORECASE
+        )
+        if people_match:
+            return people_match.group(1).strip()
         
         # First, try to match singular form (full description like "Chinese marathon runner")
         # Pattern: (Nationality + role in singular) (killed|who died) in the
@@ -496,16 +510,32 @@ def fetch_deaths_for_month(year: int, month: int) -> List[Dict]:
     return deaths
 
 
-def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime) -> List[Dict]:
+def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output_file: str) -> List[Dict]:
     """
     Fetch deaths for a range of dates by fetching monthly pages.
     Exports ALL deaths with their pageview counts (60 days after death).
+    Writes to CSV live and supports resuming from existing file.
     
     Args:
         start_date: Start of date range
-        end_date: End of date range  
+        end_date: End of date range
+        output_file: Path to output CSV file
     """
     all_deaths = []
+    completed_months: Set[Tuple[int, int]] = set()
+    
+    # Check if output file exists and load completed months
+    if os.path.exists(output_file):
+        print(f"Found existing output file: {output_file}")
+        with open(output_file, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                all_deaths.append(row)
+                # Track which months are complete
+                death_date = datetime.strptime(row['death_date'], '%Y-%m-%d')
+                completed_months.add((death_date.year, death_date.month))
+        print(f"  Loaded {len(all_deaths)} existing entries")
+        print(f"  Completed months: {sorted(completed_months)}")
     
     # Get unique year-month combinations in the range
     months_to_fetch = set()
@@ -521,7 +551,19 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime) -> Lis
     # Sort chronologically
     months_to_fetch = sorted(months_to_fetch)
     
-    for i, (year, month) in enumerate(months_to_fetch):
+    # Filter out already completed months
+    months_to_process = [m for m in months_to_fetch if m not in completed_months]
+    
+    if not months_to_process:
+        print("All months already completed!")
+        return all_deaths
+    
+    print(f"Months to process: {len(months_to_process)} (skipping {len(months_to_fetch) - len(months_to_process)} completed)")
+    
+    # Open file in append mode if exists, otherwise write mode with header
+    file_exists = os.path.exists(output_file)
+    
+    for i, (year, month) in enumerate(months_to_process):
         deaths = fetch_deaths_for_month(year, month)
         
         # Group deaths by day
@@ -535,6 +577,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime) -> Lis
                 deaths_by_day[day_key].append(death)
 
         # Get pageviews for all deaths in this month
+        month_deaths = []
         if deaths_by_day:
             # Collect all article titles + death dates for this month
             all_article_entries = []
@@ -554,25 +597,50 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime) -> Lis
                 for death in deaths_by_day[day_key]:
                     death['pageviews'] = pageview_counts.get(death['article_title'], 0)
                     death.pop('article_title', None)  # Remove helper field
+                    month_deaths.append(death)
                     all_deaths.append(death)
         
+        # Write this month's deaths to CSV immediately
+        if month_deaths:
+            # Sort by date, then by pageviews (descending) within each day
+            month_deaths.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
+            
+            with open(output_file, 'a' if file_exists else 'w', newline='', encoding='utf-8') as f:
+                fieldnames = ['name', 'death_date', 'description', 'pageviews']
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+                if not file_exists:
+                    writer.writeheader()
+                    file_exists = True
+                writer.writerows(month_deaths)
+            
+            print(f"  Wrote {len(month_deaths)} deaths to {output_file}")
+        
         # Polite delay between requests (Wikipedia asks for no more than 1 req/sec)
-        if i < len(months_to_fetch) - 1:
+        if i < len(months_to_process) - 1:
             time.sleep(1.5)
     
     return all_deaths
 
 
+def get_versioned_output_filename(base_output: str) -> str:
+    """
+    Generate output filename with version number.
+    E.g., 'deaths_data.csv' -> 'deaths_data_v1.0.csv'
+    """
+    base, ext = os.path.splitext(base_output)
+    return f"{base}_v{SCRIPT_VERSION}{ext}"
+
+
 def save_to_csv(deaths: List[Dict], output_file: str):
     """
-    Save the deaths data to a CSV file.
+    Save the deaths data to a CSV file (final save, sorts all data).
     """
     if not deaths:
         print("No deaths to save!")
         return
     
     # Sort by date, then by pageviews (descending) within each day
-    deaths.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
+    deaths.sort(key=lambda x: (x['death_date'], -int(x.get('pageviews', 0))))
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         fieldnames = ['name', 'death_date', 'description', 'pageviews']
@@ -603,7 +671,7 @@ def main():
         '--output', 
         type=str, 
         default='deaths_data.csv',
-        help='Output CSV file (default: deaths_data.csv)'
+        help='Output CSV file base name (default: deaths_data.csv). Version will be appended.'
     )
     args = parser.parse_args()
     
@@ -618,12 +686,20 @@ def main():
         print("Error: Start date must be before end date")
         return
     
+    # Generate versioned output filename
+    output_file = get_versioned_output_filename(args.output)
+    
+    print(f"Script version: {SCRIPT_VERSION}")
+    print(f"Output file: {output_file}")
     print(f"Fetching ALL deaths from {args.start} to {args.end}")
     print("Pageviews will be fetched for each person (60 days after death)")
     print("=" * 50)
     
-    deaths = fetch_deaths_for_date_range(start_date, end_date)
-    save_to_csv(deaths, args.output)
+    deaths = fetch_deaths_for_date_range(start_date, end_date, output_file)
+    
+    # Final sort and save (to ensure proper ordering after resume)
+    if deaths:
+        save_to_csv(deaths, output_file)
     
     # Print summary by month
     print("\nSummary by month:")
