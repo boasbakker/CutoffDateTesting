@@ -252,8 +252,18 @@ def main() -> None:
     print_summary(results, stats_by_month, args.min_samples)
 
     if not args.no_plot:
-        # Note: We pass args.input (the filename) instead of args.model now
-        plot_monthly_accuracy(stats_by_month, args.input, args.plot, args.min_samples)
+        # If the user didn't supply a custom --plot filename (left the default),
+        # generate one from the input filename so it contains model and date info.
+        default_plot_name = "cutoff_plot_monthly.png"
+        if not args.plot or args.plot == default_plot_name:
+            input_base = os.path.splitext(os.path.basename(args.input))[0]
+            # Save the plot next to the input file for convenience
+            input_dir = os.path.dirname(os.path.abspath(args.input)) or os.getcwd()
+            plot_file = os.path.join(input_dir, f"{input_base}_monthly.png")
+        else:
+            plot_file = args.plot
+
+        plot_monthly_accuracy(stats_by_month, args.input, plot_file, args.min_samples)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import argparse
 
 from openai import OpenAI
 from google import genai
+from google.genai import types
 import anthropic
 
 
@@ -477,22 +478,142 @@ def test_deaths_batch_gemini(
     
     # Determine thinking level based on model and reasoning flag
     # gemini-3-pro-preview doesn't support "minimal", use "low" instead
-    # When --reasoning is enabled, use "low" for all models
+    # When --reasoning is enabled, treat as low reasoning and skip sampling
+    selected = None
+    # Collect errors during probing so we can report them if all attempts fail
+    sample_errors = []
     if reasoning or "gemini-3-pro" in model_name.lower():
-        thinking_level = "low"
-    else:
-        thinking_level = "minimal"
-    
-    # Select max tokens based on thinking level
-    if thinking_level == "low":
-        max_tokens = MAX_TOKENS_LOW_REASONING
-    else:
+        selected = "low"
+
+    # If not forced to low, probe with normal Responses API using a single sample
+    if selected is None:
+        # If no deaths available, default to minimal
+        if not deaths:
+            selected = "minimal"
+        else:
+            sample_options = [None, "minimal", "low"]
+            sample_temperature = TEMPERATURE
+            sample_max_tokens = MAX_TOKENS_GEMINI_MINIMAL
+
+            # Collect errors for each probe attempt so we can report them if all fail
+            sample_errors = []
+
+            sample_prompt = None
+            try:
+                sample_prompt = PROMPT_TEMPLATE.format(name=deaths[0]['name'], description=deaths[0].get('description', ''))
+            except Exception:
+                selected = "minimal"
+
+            for opt in sample_options:
+                if selected:
+                    break
+                print(f"Trying sample request with thinking={'disabled' if opt is None else opt}...")
+                try:
+                    # Build messages for the normal Responses API (system + user)
+                    messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": sample_prompt}
+                    ]
+
+                    # Prepare simple generation config for probe
+                    gen_cfg = {"temperature": float(sample_temperature), "maxOutputTokens": sample_max_tokens}
+                    if opt is not None:
+                        gen_cfg["thinkingConfig"] = {"thinkingLevel": opt.upper()}
+
+                    # Use the Text Generation API (generate_content) for a quick probe per docs
+                    # Build a GenerateContentConfig with thinking settings
+                    from google.genai import types
+
+                    cfg = types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=float(sample_temperature),
+                        max_output_tokens=sample_max_tokens
+                    )
+                    if opt is None:
+                        # disable thinking by setting budget=0
+                        cfg.thinking_config = types.ThinkingConfig(thinking_budget=0)
+                    else:
+                        cfg.thinking_config = types.ThinkingConfig(thinking_level=opt.upper())
+
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=sample_prompt,
+                        config=cfg
+                    )
+
+                    # Extract text from the response
+                    answer = None
+                    try:
+                        # Many SDK shapes expose .text
+                        if getattr(resp, 'text', None):
+                            answer = resp.text.strip()
+                        # Fallback: resp.output or resp.outputs
+                        elif getattr(resp, 'output', None):
+                            out = resp.output
+                            if isinstance(out, list) and out:
+                                first = out[0]
+                                if isinstance(first, dict) and 'content' in first:
+                                    for c in first['content']:
+                                        if isinstance(c, dict) and 'text' in c:
+                                            answer = c['text'].strip()
+                                            break
+                        elif getattr(resp, 'outputs', None):
+                            outs = resp.outputs
+                            if isinstance(outs, list) and outs:
+                                first = outs[0]
+                                text = getattr(first, 'text', None) if not isinstance(first, dict) else first.get('text')
+                                if text:
+                                    answer = text.strip()
+                    except Exception:
+                        answer = None
+
+                    if not answer:
+                        msg = f"{opt or 'disabled'}: empty or missing answer"
+                        print(f"  Sample: {msg}")
+                        sample_errors.append(msg)
+                        continue
+
+                    knows, err = parse_yes_no_response_safe(answer)
+                    if err:
+                        msg = f"{opt or 'disabled'}: parsing failed: {err}"
+                        print(f"  Sample parsing failed: {err}")
+                        sample_errors.append(msg)
+                        continue
+
+                    selected = opt if opt is not None else "disabled"
+                    print(f"  Sample succeeded with thinking={selected}; using this for full batch")
+
+                except Exception as e:
+                    msg = f"{opt or 'disabled'}: exception: {e}"
+                    print(f"  Sample request failed: {e}")
+                    sample_errors.append(msg)
+
+    # Decide final thinking_level, temperature and max_tokens based on selection
+    if selected is None:
+        # All probes failed - report errors, do NOT upload the batch, and exit
+        print("All sample probes failed. Errors:")
+        for e in sample_errors:
+            print(f"  - {e}")
+        print("Aborting: not submitting batch job.")
+        # Exit with non-zero code so CI/automation can detect failure
+        import sys
+        sys.exit(1)
+    elif selected == "disabled":
+        thinking_level = None
         max_tokens = MAX_TOKENS_GEMINI_MINIMAL
-    
-    temperature = 1 if reasoning else TEMPERATURE
-    
+        temperature = TEMPERATURE
+    elif selected == "minimal":
+        thinking_level = "minimal"
+        max_tokens = MAX_TOKENS_GEMINI_MINIMAL
+        temperature = TEMPERATURE
+    else:  # low
+        thinking_level = "low"
+        max_tokens = MAX_TOKENS_LOW_REASONING
+        temperature = 1
+
+
     # Build requests for Gemini Batch API using file-based input with keys
-    system_prompt = SYSTEM_PROMPT_REASONING if reasoning else SYSTEM_PROMPT
+    system_prompt = SYSTEM_PROMPT_REASONING if thinking_level == 'low' else SYSTEM_PROMPT
     
     debug_print_settings("Gemini", {
         'model': model_name,
@@ -517,14 +638,14 @@ def test_deaths_batch_gemini(
                         "parts": [{"text": prompt}],
                         "role": "user"
                     }],
-                    "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "generationConfig": {
-                        "temperature": float(temperature),
-                        "maxOutputTokens": max_tokens,
-                        "thinkingConfig": {"thinkingLevel": thinking_level.upper()}
-                    }
+                    "systemInstruction": {"parts": [{"text": system_prompt}]}
                 }
             }
+            # Attach generationConfig and optionally thinkingConfig
+            gen_cfg = {"temperature": float(temperature), "maxOutputTokens": max_tokens}
+            if thinking_level is not None:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level.upper()}
+            request_obj["request"]["generationConfig"] = gen_cfg
             f.write(json.dumps(request_obj) + '\n')
             if i == 0:
                 debug_print(f"Sample request (first): {request_obj}")
