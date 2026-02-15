@@ -23,31 +23,123 @@ WIKI_HEADERS = {
 }
 
 
-def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'after') -> int:
+def get_page_creation_date(article_title: str) -> Optional[datetime]:
     """
-    Get total pageviews for an article.
-    mode='after': 1 day before death up to 60 days after (death incl. margin).
-    mode='before': 60 days ending 6 days before death (death excl. margin).
-    
-    Returns -1 if the page doesn't exist (404).
+    Get the creation date of a Wikipedia article by fetching its first revision.
+    Returns None if the page doesn't exist.
     """
-    # Pageviews API expects underscores instead of spaces
-    safe_title = article_title.replace(' ', '_')
-    
-    if mode == 'after':
-        # Start: 1 day before death
-        # End: 60 days total duration
-        start_dt = death_date - timedelta(days=1)
-        end_dt = start_dt + timedelta(days=60)
-    else: # mode == 'before'
-        # End: 6 days before death (to avoid illness/hospice spikes)
-        # Start: 60 days duration backwards
-        end_dt = death_date - timedelta(days=6)
-        start_dt = end_dt - timedelta(days=60)
-        
+    url = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query",
+        "titles": article_title,
+        "prop": "revisions",
+        "rvprop": "timestamp",
+        "rvlimit": "1",
+        "rvdir": "newer",
+        "format": "json"
+    }
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=30)
+            if resp.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            pages = data.get("query", {}).get("pages", {})
+            for pid, page in pages.items():
+                if "missing" in page:
+                    return None
+                revisions = page.get("revisions", [])
+                if revisions:
+                    ts = revisions[0]["timestamp"]  # e.g. "2020-01-01T12:00:00Z"
+                    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+            return None
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                return None
+            time.sleep(1)
+    return None
+
+
+def resolve_redirects(titles: List[str]) -> Dict[str, str]:
+    """
+    Batch-resolve Wikipedia redirects for a list of article titles.
+    Returns mapping: original_title -> canonical_title.
+    Non-redirect titles map to themselves. Missing pages are omitted.
+    """
+    result = {}
+    chunk_size = 50
+    session = requests.Session()
+    session.headers.update(WIKI_HEADERS)
+
+    for i in range(0, len(titles), chunk_size):
+        chunk = titles[i:i+chunk_size]
+        params = {
+            "action": "query",
+            "titles": "|".join(chunk),
+            "redirects": "1",
+            "format": "json"
+        }
+        for attempt in range(3):
+            try:
+                resp = session.get("https://en.wikipedia.org/w/api.php",
+                                   params=params, timeout=30)
+                if resp.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Build normalized map: API-normalized title -> original title
+                norm_map = {}
+                for n in data.get("query", {}).get("normalized", []):
+                    norm_map[n["to"]] = n["from"]
+
+                # Build redirect map: redirect target -> redirect source
+                redir_map = {}
+                for r in data.get("query", {}).get("redirects", []):
+                    redir_map[r["to"]] = r["from"]
+
+                # Map each existing page back to the original title
+                pages = data.get("query", {}).get("pages", {})
+                for pid, page in pages.items():
+                    if "missing" in page:
+                        continue
+                    canonical = page["title"]
+
+                    # Trace back: canonical -> redirect source -> normalized source
+                    source = redir_map.get(canonical, canonical)
+                    source = norm_map.get(source, source)
+
+                    if source in chunk:
+                        result[source] = canonical
+
+                # Titles that weren't redirected map to themselves
+                for t in chunk:
+                    if t not in result:
+                        # Check if it exists (wasn't in missing pages)
+                        for pid, page in pages.items():
+                            if page.get("title") == t and "missing" not in page:
+                                result[t] = t
+                                break
+                break
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    print(f"    Error resolving redirects for chunk")
+                time.sleep(1)
+        time.sleep(0.3)  # Polite delay
+
+    return result
+
+
+def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime) -> int:
+    """
+    Low-level pageviews fetch for a single title and date range.
+    Returns view count, 0 if no data, or -1 if 404.
+    """
     start = start_dt.strftime('%Y%m%d')
     end = end_dt.strftime('%Y%m%d')
-    
     url = (
         "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
         f"en.wikipedia.org/all-access/user/{safe_title}/daily/{start}/{end}"
@@ -57,23 +149,61 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
         try:
             resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
             if resp.status_code == 429:
-                # Rate limit hit, wait and retry
                 time.sleep(2 * (attempt + 1))
                 continue
             if resp.status_code == 404:
-                return -1  # Page not found - article doesn't exist
+                return -1
             resp.raise_for_status()
             break
         except requests.exceptions.RequestException:
             if attempt == 2:
                 raise
             time.sleep(1)
-            
     if not resp:
         return 0
-        
     data = resp.json()
     return sum(item.get('views', 0) for item in data.get('items', []))
+
+
+def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'after') -> int:
+    """
+    Get total pageviews for an article.
+    mode='after': 1 day before death up to 60 days after (death incl. margin).
+    mode='before': 60 days ending 6 days before death (death excl. margin).
+
+    On 404 from the pageviews API, checks the page creation date:
+    - Page doesn't exist at all -> returns -1 (error).
+    - Page created after the counting period -> returns 0.
+    - Page created during the counting period -> re-fetches from creation date.
+    """
+    safe_title = article_title.replace(' ', '_')
+
+    if mode == 'after':
+        start_dt = death_date - timedelta(days=1)
+        end_dt = start_dt + timedelta(days=60)
+    else:  # mode == 'before'
+        end_dt = death_date - timedelta(days=6)
+        start_dt = end_dt - timedelta(days=60)
+
+    views = _fetch_pageviews_raw(safe_title, start_dt, end_dt)
+    if views != -1:
+        return views
+
+    # 404 received — check if the page actually exists and when it was created
+    creation_date = get_page_creation_date(article_title)
+    if creation_date is None:
+        return -1  # Page truly doesn't exist
+
+    if creation_date > end_dt:
+        # Page was created after the counting period ends
+        return 0
+
+    if creation_date > start_dt:
+        # Page was created during the counting period — re-fetch from creation date
+        return _fetch_pageviews_raw(safe_title, creation_date, end_dt)
+
+    # Page existed before the period but API still returned 404 (unusual)
+    return 0
 
 
 def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 2) -> Dict[str, int]:
@@ -803,11 +933,21 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
                         'death_date': datetime.strptime(death['death_date'], '%Y-%m-%d')
                     })
 
+            # Resolve redirects so pageviews and birth dates use canonical titles
+            raw_titles = [entry['article_title'] for entry in all_article_entries]
+            redirect_map = resolve_redirects(raw_titles)
+            for entry in all_article_entries:
+                entry['article_title'] = redirect_map.get(entry['article_title'], entry['article_title'])
+            # Also update deaths_by_day so later lookups match
+            for day_deaths_list in deaths_by_day.values():
+                for death in day_deaths_list:
+                    death['article_title'] = redirect_map.get(death['article_title'], death['article_title'])
+
             # Get pageview counts for all articles in this month (parallel requests)
             print(f"  Fetching pageview counts ({mode} mode) for {len(all_article_entries)} articles...")
             pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode)
 
-            # NEW: Get birth dates for all articles (strict filtering)
+            # Get birth dates for all articles (strict filtering)
             article_titles = [entry['article_title'] for entry in all_article_entries]
             birth_dates_map = get_birth_dates_for_articles(article_titles)
 
@@ -977,6 +1117,12 @@ def process_existing_file(input_file: str, output_file: str, mode: str = 'after'
                 
             # Fetch data for batch
             print(f"  Processing batch {i//BATCH_SIZE + 1} ({len(article_batch)} items)...")
+
+            # 0. Resolve redirects so all lookups use canonical titles
+            raw_titles = [e['article_title'] for e in article_batch]
+            redirect_map = resolve_redirects(raw_titles)
+            for item in article_batch:
+                item['article_title'] = redirect_map.get(item['article_title'], item['article_title'])
             
             # 1. Pageviews
             pageview_counts = get_pageviews_for_articles(article_batch, mode=mode)
