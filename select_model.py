@@ -170,32 +170,59 @@ def _fetch_openai_models():
     Fetch text→text model IDs from OpenAI.
 
     OpenAI's list endpoint provides no capability metadata, so we probe each
-    model with a minimal chat completion call to check support. Uses
-    concurrent threads for speed.
+    model with a minimal chat completion call to check support. Results are
+    cached in a JSON file (openai_model_cache.json) next to this script so
+    already-probed models are not re-tested on subsequent runs.
     """
+    import json as _json
     from openai import OpenAI
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "openai_model_cache.json")
+
+    # Load existing cache: { model_id: bool (true=text-capable) }
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                cache = _json.load(f)
+        except (ValueError, OSError):
+            cache = {}
 
     client = OpenAI()
     all_models = sorted(m.id for m in client.models.list())
 
-    print(f"  Probing {len(all_models)} models for chat support...")
-    text_models = []
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {
-            pool.submit(_probe_openai_chat, client, mid): mid
-            for mid in all_models
-        }
-        done_count = 0
-        for future in as_completed(futures):
-            done_count += 1
-            mid = futures[future]
-            if future.result():
-                text_models.append(mid)
-            # Progress indicator
-            print(f"\r  Probed {done_count}/{len(all_models)} models...", end="", flush=True)
-    print()  # newline after progress
-    return sorted(text_models)
+    # Determine which models need probing
+    to_probe = [mid for mid in all_models if mid not in cache]
+
+    if to_probe:
+        print(f"  Probing {len(to_probe)} new models for chat support "
+              f"({len(all_models) - len(to_probe)} cached)...")
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {
+                pool.submit(_probe_openai_chat, client, mid): mid
+                for mid in to_probe
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                mid = futures[future]
+                cache[mid] = future.result()
+                print(f"\r  Probed {done_count}/{len(to_probe)} models...",
+                      end="", flush=True)
+        print()
+
+        # Save updated cache
+        try:
+            with open(CACHE_FILE, 'w') as f:
+                _json.dump(cache, f, indent=2, sort_keys=True)
+        except OSError as e:
+            print(f"  Warning: could not save cache: {e}")
+    else:
+        print(f"  All {len(all_models)} models found in cache.")
+
+    return sorted(mid for mid in all_models if cache.get(mid, False))
 
 
 def _fetch_google_models():
