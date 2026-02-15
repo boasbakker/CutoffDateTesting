@@ -40,6 +40,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 | `query_llm.py` | ~1022 | Queries LLMs (OpenAI/Claude/Gemini) about deaths, uses structured outputs, exports results CSV |
 | `process_results.py` | ~454 | Generates accuracy statistics by date/month/pageviews, produces plots |
 | `process_results_monthly.py` | ~270 | Monthly accuracy analysis with trend lines, cleaner axis labels |
+| `select_model.py` | ~270 | Interactive model selector: provider → series → level → version via single-keypress input. Importable (`from select_model import select_model`) or standalone. |
 
 ### Data Files
 
