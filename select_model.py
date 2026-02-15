@@ -266,10 +266,11 @@ def _fetch_anthropic_models():
 
 def _classify_openai(model_id):
     """
-    Classify an OpenAI model ID into (series, level).
+    Classify an OpenAI model ID into (series, level, sublevel).
 
-    Series: 'GPT-3.x (legacy)', 'GPT-4.x', 'GPT-5.x', 'o-series', 'Other'
-    Level:  'nano', 'mini', 'standard', 'pro', '4', '4o', '4.1', '5', '5.1', '5.2', …
+    Series:   'GPT-3.x (legacy)', 'GPT-4.x', 'GPT-5.x', 'o-series', 'Other'
+    Level:    'nano', 'mini', 'standard', 'pro'
+    Sublevel: '4'/'4o'/'4.1' for GPT-4.x standard, '5'/'5.1'/'5.2' for GPT-5.x standard, else None
     """
     mid = model_id.lower()
 
@@ -282,7 +283,7 @@ def _classify_openai(model_id):
             level = 'pro'
         else:
             level = 'standard'
-        return series, level
+        return series, level, None
 
     # GPT models (including chatgpt-* aliases)
     if 'gpt' in mid or mid in ('babbage-002', 'davinci-002'):
@@ -304,34 +305,37 @@ def _classify_openai(model_id):
         else:
             series = 'GPT (other)'
 
-        # Determine level/tier
+        # Determine level/tier (nano/mini/standard/pro)
         if 'nano' in mid:
             level = 'nano'
         elif 'mini' in mid:
             level = 'mini'
         elif 'pro' in mid:
             level = 'pro'
-        elif major == 4:
-            # Subcategorize GPT-4.x standard: 4, 4o, 4.1
-            if '4o' in mid:
-                level = '4o'
-            elif '4.1' in mid:
-                level = '4.1'
-            else:
-                level = '4'
-        elif major >= 5:
-            # Subcategorize GPT-5+: 5, 5.1, 5.2, etc.
-            minor_match = re.search(r'gpt-?\d+\.(\d+)', mid)
-            if minor_match:
-                level = f'{major}.{minor_match.group(1)}'
-            else:
-                level = str(major)
         else:
             level = 'standard'
-        return series, level
+
+        # Determine sublevel (within standard tier)
+        sublevel = None
+        if level == 'standard':
+            if major == 4:
+                if '4o' in mid:
+                    sublevel = '4o'
+                elif '4.1' in mid:
+                    sublevel = '4.1'
+                else:
+                    sublevel = '4'
+            elif major >= 5:
+                minor_match = re.search(r'gpt-?\d+\.(\d+)', mid)
+                if minor_match:
+                    sublevel = f'{major}.{minor_match.group(1)}'
+                else:
+                    sublevel = str(major)
+
+        return series, level, sublevel
 
     # Catch-all
-    return 'Other', 'other'
+    return 'Other', 'other', None
 
 
 def _classify_google(model_id):
@@ -521,16 +525,22 @@ def select_model():
 
     print(f"  Found {len(model_ids)} models.")
 
-    # Classify all models into (series, level)
-    classified = []  # list of (model_id, series, level)
+    # Classify all models into (series, level, sublevel)
+    classified = []  # list of (model_id, series, level, sublevel)
     for mid in model_ids:
-        series, level = classify_fn(mid)
-        classified.append((mid, series, level))
+        result = classify_fn(mid)
+        # Support both 2-tuple and 3-tuple classifiers
+        if len(result) == 3:
+            series, level, sublevel = result
+        else:
+            series, level = result
+            sublevel = None
+        classified.append((mid, series, level, sublevel))
 
     # Step 3: series selection
     series_groups = defaultdict(list)
-    for mid, series, level in classified:
-        series_groups[series].append((mid, level))
+    for mid, series, level, sublevel in classified:
+        series_groups[series].append((mid, level, sublevel))
 
     series_options = [
         (models[0][0] if len(models) == 1 else f"{s} ({len(models)} models)", s)
@@ -544,21 +554,41 @@ def select_model():
 
     # Step 4: level/tier selection (skip if all models share one level)
     level_groups = defaultdict(list)
-    for mid, level in models_in_series:
-        level_groups[level].append(mid)
+    for mid, level, sublevel in models_in_series:
+        level_groups[level].append((mid, sublevel))
 
     if len(level_groups) > 1:
         level_options = [
-            (mids[0] if len(mids) == 1 else f"{lvl} ({len(mids)} models)", lvl)
-            for lvl, mids in sorted(level_groups.items())
+            (items[0][0] if len(items) == 1 else f"{lvl} ({len(items)} models)", lvl)
+            for lvl, items in sorted(level_groups.items())
         ]
         selected_level = keypress_select(level_options, "Select level/tier")
         if selected_level is None:
             return None
-        remaining = level_groups[selected_level]
+        models_after_level = level_groups[selected_level]
     else:
         # Only one level — skip the prompt
-        remaining = list(level_groups.values())[0]
+        models_after_level = list(level_groups.values())[0]
+
+    # Step 4b: sublevel selection (e.g. 4/4o/4.1 or 5/5.1/5.2)
+    sublevel_groups = defaultdict(list)
+    for mid, sublevel in models_after_level:
+        sublevel_groups[sublevel].append(mid)
+
+    # Only show sublevel step if there are multiple distinct sublevels
+    distinct_sublevels = [s for s in sublevel_groups if s is not None]
+    if len(distinct_sublevels) > 1:
+        sub_options = [
+            (mids[0] if len(mids) == 1 else f"{sl} ({len(mids)} models)", sl)
+            for sl, mids in sorted(sublevel_groups.items()) if sl is not None
+        ]
+        selected_sub = keypress_select(sub_options, "Select sub-series")
+        if selected_sub is None:
+            return None
+        remaining = sublevel_groups[selected_sub]
+    else:
+        # No meaningful sublevel split — flatten all
+        remaining = [mid for mid, _ in models_after_level]
 
     # Step 5: specific version
     version_options = [(mid, mid) for mid in sorted(remaining)]
