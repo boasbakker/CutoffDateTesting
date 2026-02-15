@@ -105,22 +105,68 @@ def keypress_select(options, prompt_title="Select an option"):
 # Model fetching — one function per provider
 # ---------------------------------------------------------------------------
 
+# OpenAI model ID prefixes/suffixes that are NOT text→text
+_OPENAI_EXCLUDE_PREFIXES = ('dall-e', 'tts-', 'whisper-', 'text-embedding', 'sora-', 'omni-moderation')
+_OPENAI_EXCLUDE_SUFFIXES = ('-tts', '-transcribe', '-realtime', '-image')
+_OPENAI_EXCLUDE_CONTAINS = ('-tts-', '-transcribe-', '-realtime-', '-audio', '-image-', 'chatgpt-image')
+
+
+def _is_openai_text_model(model_id):
+    """Return True if an OpenAI model ID is a text→text model (not image/audio/embedding/moderation)."""
+    mid = model_id.lower()
+    for prefix in _OPENAI_EXCLUDE_PREFIXES:
+        if mid.startswith(prefix):
+            return False
+    for suffix in _OPENAI_EXCLUDE_SUFFIXES:
+        if mid.endswith(suffix):
+            return False
+    for pattern in _OPENAI_EXCLUDE_CONTAINS:
+        if pattern in mid:
+            return False
+    return True
+
+
 def _fetch_openai_models():
-    """Fetch all model IDs from OpenAI. Returns a sorted list of model ID strings."""
+    """Fetch text→text model IDs from OpenAI (excludes image/audio/embedding/moderation models)."""
     from openai import OpenAI
     client = OpenAI()
     models = client.models.list()
-    return sorted(m.id for m in models)
+    return sorted(m.id for m in models if _is_openai_text_model(m.id))
+
+
+# Google model name patterns that are NOT text→text
+_GOOGLE_EXCLUDE_CONTAINS = ('imagen', 'veo-', 'embedding', '-tts', 'native-audio', '-image')
+
+
+def _is_google_text_model(model):
+    """Return True if a Google model supports text→text generation (based on supported_actions and name)."""
+    actions = model.supported_actions or []
+    name = (model.name or '').lower()
+    # Must support generateContent (the standard text generation action)
+    if 'generateContent' not in actions:
+        return False
+    # Exclude models that only have bidiGenerateContent (live/streaming audio)
+    if 'bidiGenerateContent' in actions and 'createCachedContent' not in actions:
+        return False
+    # Exclude by name patterns
+    for pattern in _GOOGLE_EXCLUDE_CONTAINS:
+        if pattern in name:
+            return False
+    # Exclude the special 'aqa' model (question-answering only)
+    if name.endswith('/aqa') or name == 'aqa':
+        return False
+    return True
 
 
 def _fetch_google_models():
-    """Fetch all model IDs from Google Gemini. Returns a sorted list of model ID strings."""
+    """Fetch text→text model IDs from Google (excludes image/video/embedding/audio-only models)."""
     from google import genai
     client = genai.Client(api_key=os.environ.get('GOOGLE_API_KEY'))
-    models = client.models.list()
-    # Model names come as "models/gemini-2.0-flash" — strip the "models/" prefix
+    models = list(client.models.list())
     ids = []
     for m in models:
+        if not _is_google_text_model(m):
+            continue
         name = m.name
         if name.startswith('models/'):
             name = name[len('models/'):]
