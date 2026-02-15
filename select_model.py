@@ -225,26 +225,154 @@ def _fetch_openai_models():
     return sorted(mid for mid in all_models if cache.get(mid, False))
 
 
+def _probe_google_text_support(client, model_id):
+    """
+    Probe whether a Google model supports text→text generation.
+    
+    Returns True if the model successfully generates text from a text prompt.
+    Returns False if it raises a modality error (e.g. "Audio only") or returns no text.
+    """
+    from google.genai import types
+    
+    try:
+        # We use a very simple prompt with a small token limit to save cost/time
+        response = client.models.generate_content(
+            model=model_id,
+            contents="hi",
+            config=types.GenerateContentConfig(
+                max_output_tokens=5,
+                temperature=0.0
+            )
+        )
+        
+        # Check if we got text back
+        if response.text and response.text.strip():
+            return True
+            
+        # If response.text is None, it might be an image/audio-only model returning blobs
+        return False
+        
+    except Exception as e:
+        # Check for specific error messages regarding supported capabilities
+        err_str = str(e).lower()
+        if "response modalities" in err_str and "text" in err_str and "not supported" in err_str:
+            return False
+        if "requires the use of the computer use tool" in err_str:
+            return False
+        
+        # Other errors (e.g. 500, quota) -> assume True to be safe? 
+        # Or False to be strict? User said "Models which don't support text->text must be ignored"
+        # If we can't verify it, we probably shouldn't show it.
+        # However, transient errors shouldn't delist valid models.
+        # But for "invalid argument" type errors, it's definitely False.
+        if "invalid_argument" in err_str or "not found" in err_str:
+            return False
+            
+        # For other errors, we might want to log but maybe default to inclusion 
+        # specifically if it feels like a network flake? 
+        # Actually safer to exclude if we are strict about "must be ignored".
+        return False
+
+
 def _fetch_google_models():
     """
     Fetch text→text model IDs from Google Gemini.
-
-    Uses the `supported_actions` metadata field to filter for models that
-    support `generateContent` (i.e. text generation).
+    
+    Probes models to ensure they actually support text→text generation,
+    filtering out audio-only (TTS), image-only (Imagen), etc.
+    Results are cached in google_model_cache.json.
     """
+    import json as _json
     from google import genai
-    client = genai.Client(api_key=os.environ.get('GOOGLE_API_KEY'))
-    ids = []
-    for m in client.models.list():
-        # Only include models that support text generation
-        actions = getattr(m, 'supported_actions', None) or []
-        if 'generateContent' not in actions:
-            continue
-        name = m.name
-        if name.startswith('models/'):
-            name = name[len('models/'):]
-        ids.append(name)
-    return sorted(ids)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "google_model_cache.json")
+
+    # Load existing cache: { model_id: bool (true=text-capable) }
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                cache = _json.load(f)
+        except (ValueError, OSError):
+            cache = {}
+
+    api_key = os.environ.get('GOOGLE_API_KEY')
+    if not api_key:
+        # Fallback if no key, just return nothing or crash later.
+        # But commonly we might want to just let the client creation fail or return empty.
+        # The original code crashed on client creation if key was missing? 
+        # No, client creation doesn't crash until you use it usually, but let's be safe.
+        pass
+
+    client = genai.Client(api_key=api_key)
+    
+    # 1. List all models
+    all_models = []
+    try:
+        for m in client.models.list():
+            name = m.name
+            if name.startswith('models/'):
+                name = name[len('models/'):]
+            
+            # fast-path filtering based on obvious names to avoid probing useless stuff
+            if 'embedding' in name or 'bison' in name:
+                continue
+                
+            # Filter by supported_actions broadly first
+            actions = getattr(m, 'supported_actions', None) or []
+            if 'generateContent' not in actions:
+                continue
+                
+            all_models.append(name)
+    except Exception:
+        # if list fails (e.g. auth), return empty
+        return []
+
+    all_models.sort()
+
+    # 2. Determine which need probing
+    to_probe = [mid for mid in all_models if mid not in cache]
+
+    if to_probe:
+        print(f"  Probing {len(to_probe)} new Google models for text support...")
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {
+                pool.submit(_probe_google_text_support, client, mid): mid
+                for mid in to_probe
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                mid = futures[future]
+                is_text = future.result()
+                cache[mid] = is_text
+                # Optional: print progress
+                # print(f"\r  Probed {done_count}/{len(to_probe)}...", end="", flush=True)
+
+        # Save updated cache
+        try:
+            with open(CACHE_FILE, 'w') as f:
+                _json.dump(cache, f, indent=2, sort_keys=True)
+        except OSError:
+            pass
+    
+    # 3. Return only those that are True in cache
+    # Also double check they are still in the list (in case they were deleted from API but in cache)
+    # actually cache might have old models that don't exist anymore, which is fine, 
+    # but we only return ones that are in `all_models` AND valid.
+    
+    # But wait, if we only return intersection, we lose the benefit of cache for models 
+    # that might be transiently missing? No, `client.models.list()` is the source of truth for "existence".
+    # Cache is source of truth for "capability".
+    
+    valid_ids = []
+    for mid in all_models:
+        if cache.get(mid, False):
+            valid_ids.append(mid)
+            
+    return sorted(valid_ids)
 
 
 def _fetch_anthropic_models():
