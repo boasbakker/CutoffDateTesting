@@ -4,6 +4,7 @@ Calls APIs (OpenAI, Claude, Gemini) and saves raw results.
 """
 
 import csv
+import json
 import os
 import time
 from datetime import datetime
@@ -41,6 +42,17 @@ SYSTEM_PROMPT_CLAUDE_REASONING = 'Answer only "Yes" or "No". Nothing else. Produ
 
 # Prompt template - use .format(name=..., description=...) to fill in
 PROMPT_TEMPLATE = 'Is {name}, {description}, still alive?'
+
+# Structured output schema: forces LLM to respond with {"answer": true/false}.
+# answer=true means "alive" (doesn't know about death), answer=false means "dead" (knows about death).
+STRUCTURED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "boolean"}
+    },
+    "required": ["answer"],
+    "additionalProperties": False
+}
 
 # Default models
 DEFAULT_MODEL_OPENAI = "gpt-5.2"
@@ -104,6 +116,46 @@ def parse_yes_no_response_safe(answer: str) -> Tuple[bool, str]:
         return parse_yes_no_response(answer), None
     except ValueError as e:
         return None, str(e)
+
+
+def parse_structured_response(raw_text: str) -> Tuple[bool, str]:
+    """Parse a structured JSON response with {"answer": bool}.
+    Returns (knows_death, raw_text). answer=true means alive (knows_death=False).
+    Raises ValueError on parse failure.
+    """
+    parsed = json.loads(raw_text)
+    answer = parsed["answer"]
+    if not isinstance(answer, bool):
+        raise ValueError(f"Expected boolean 'answer', got {type(answer).__name__}: {answer}")
+    # answer=True means "still alive" → doesn't know about death
+    # answer=False means "not alive" → knows about death
+    knows_death = not answer
+    return knows_death, raw_text
+
+
+def parse_structured_response_safe(raw_text: str) -> Tuple[bool, str]:
+    """Parse a structured JSON response safely, returning (result, error_message).
+    Returns (bool, None) on success, (None, error_message) on failure.
+    """
+    try:
+        knows_death, _ = parse_structured_response(raw_text)
+        return knows_death, None
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        return None, str(e)
+
+
+def is_claude_structured_supported(model_name: str) -> bool:
+    """Check if a Claude model supports native structured outputs (output_config).
+    Structured outputs are GA for Claude 4.5+ models. Older 3.x models use prefilling fallback.
+    """
+    # Models with native structured output support contain "4-5", "4.5", "4-6", "4.6" or higher
+    import re
+    # Match version numbers like 4-5, 4.5, 4-6, 4.6, etc. (version >= 4.5)
+    match = re.search(r'(\d+)[\.-](\d+)', model_name)
+    if match:
+        major, minor = int(match.group(1)), int(match.group(2))
+        return major > 4 or (major == 4 and minor >= 5)
+    return False
 
 
 def select_top_deaths_by_pageviews(
@@ -210,7 +262,15 @@ def check_death_knowledge(client: OpenAI, name: str, description: str, model: st
                 max_completion_tokens=current_max_tokens,
                 temperature=temperature,
                 service_tier="flex",
-                reasoning_effort=reasoning_effort
+                reasoning_effort=reasoning_effort,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "alive_check",
+                        "strict": True,
+                        "schema": STRUCTURED_SCHEMA
+                    }
+                }
             )
             
             debug_print(f"Full response object: {response}")
@@ -236,7 +296,7 @@ def check_death_knowledge(client: OpenAI, name: str, description: str, model: st
             else:
                 answer = ""
             print(f"Answer: '{answer}'")
-            return parse_yes_no_response(answer), answer
+            return parse_structured_response(answer)
         
         except Exception as e:
             print(f"\n  Error querying for {name}: {e}")
@@ -359,6 +419,9 @@ def test_deaths_batch_claude(
     client = anthropic.Anthropic()
     deaths = select_top_deaths_by_pageviews(deaths, top_per_day, top_per_month, min_views)
     
+    # Check if native structured outputs are supported for this model
+    use_native_structured = is_claude_structured_supported(model_name)
+    
     # When reasoning is enabled, use extended thinking with minimum budget (1024)
     # max_tokens includes both thinking budget AND output tokens
     # budget_tokens must be less than max_tokens
@@ -367,24 +430,35 @@ def test_deaths_batch_claude(
     # Thinking config: enabled with budget_tokens when reasoning, disabled otherwise
     if reasoning:
         thinking_budget = 1024  # Minimum allowed
-        max_tokens = thinking_budget + MAX_TOKENS_CLAUDE  # thinking + output (Yes/No)
+        max_tokens = thinking_budget + MAX_TOKENS_CLAUDE  # thinking + output
         thinking_config = {"type": "enabled", "budget_tokens": thinking_budget}
     else:
         max_tokens = MAX_TOKENS_CLAUDE
         thinking_config = {"type": "disabled"}
     
+    # Increase max_tokens for structured output (JSON uses more tokens than plain Yes/No)
+    if use_native_structured:
+        max_tokens = max(max_tokens, 30)
+    
     total = len(deaths)
-    print(f"Testing {total} deaths with model: {model_name} (using Batch API, max_tokens={max_tokens}, thinking={'enabled (1024)' if reasoning else 'disabled'})")
+    structured_mode = "native output_config" if use_native_structured else "prefilling+stop_sequence"
+    print(f"Testing {total} deaths with model: {model_name} (using Batch API, structured={structured_mode}, max_tokens={max_tokens}, thinking={'enabled (1024)' if reasoning else 'disabled'})")
     print("=" * 50)
     
     # Build batch requests
     system_prompt = SYSTEM_PROMPT_CLAUDE_REASONING if reasoning else SYSTEM_PROMPT_CLAUDE
+    # For structured output, tell the model to output JSON
+    if use_native_structured:
+        system_prompt += ' Respond with a JSON object {"answer": true} if alive, {"answer": false} if dead.'
+    else:
+        system_prompt += ' Respond with a JSON object {"answer": true} if alive, {"answer": false} if dead.'
     
     debug_print_settings("Claude", {
         'model': model_name,
         'max_tokens': max_tokens,
         'temperature': temperature,
         'thinking': thinking_config,
+        'structured_mode': structured_mode,
         'system_prompt': system_prompt,
         'prompt_template': PROMPT_TEMPLATE
     })
@@ -397,9 +471,26 @@ def test_deaths_batch_claude(
             "max_tokens": max_tokens,
             "temperature": temperature,
             "system": system_prompt,
-            "messages": [{"role": "user", "content": prompt}],
             "thinking": thinking_config
         }
+        
+        if use_native_structured:
+            # Native structured output via output_config
+            params["messages"] = [{"role": "user", "content": prompt}]
+            params["output_config"] = {
+                "format": {
+                    "type": "json_schema",
+                    "schema": STRUCTURED_SCHEMA
+                }
+            }
+        else:
+            # Prefilling fallback for older models: prefill with '{"answer":' and use stop sequence '}'
+            params["messages"] = [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": '{"answer":'}
+            ]
+            params["stop_sequences"] = ["}"]
+        
         batch_requests.append({
             "custom_id": str(i),
             "params": params
@@ -434,12 +525,22 @@ def test_deaths_batch_claude(
         debug_print(f"Result {custom_id}: {entry}")
         if entry.result.type == "succeeded":
             try:
-                answer = entry.result.message.content[0].text.strip()
-                knows_death, error = parse_yes_no_response_safe(answer)
-                if error:
-                    result_map[custom_id] = (None, f"{answer} (parse error: {error})")
+                raw_text = entry.result.message.content[0].text.strip()
+                
+                if use_native_structured:
+                    # Native structured output: response is a full JSON object
+                    knows_death, error = parse_structured_response_safe(raw_text)
                 else:
-                    result_map[custom_id] = (knows_death, answer)
+                    # Prefilling fallback: model returned the value after '{"answer":',
+                    # stopped at '}'. Reconstruct full JSON.
+                    full_json = '{"answer":' + raw_text + '}'
+                    knows_death, error = parse_structured_response_safe(full_json)
+                    raw_text = full_json  # Store the reconstructed JSON
+                
+                if error:
+                    result_map[custom_id] = (None, f"{raw_text} (parse error: {error})")
+                else:
+                    result_map[custom_id] = (knows_death, raw_text)
             except Exception as e:
                 result_map[custom_id] = (None, f"Error parsing response: {e}")
         else:
@@ -466,7 +567,6 @@ def test_deaths_batch_gemini(
     Submits all requests at once and waits for completion.
     Always returns results (never exits on error for batch).
     """
-    import json
     import tempfile
     
     client = genai.Client(api_key=os.environ.get('GOOGLE_API_KEY'))
@@ -527,7 +627,9 @@ def test_deaths_batch_gemini(
                     cfg = types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
                         temperature=float(sample_temperature),
-                        max_output_tokens=sample_max_tokens
+                        max_output_tokens=sample_max_tokens,
+                        response_mime_type="application/json",
+                        response_json_schema=STRUCTURED_SCHEMA
                     )
                     if opt is None:
                         # disable thinking by setting budget=0
@@ -573,7 +675,7 @@ def test_deaths_batch_gemini(
                         sample_errors.append(msg)
                         continue
 
-                    knows, err = parse_yes_no_response_safe(answer)
+                    knows, err = parse_structured_response_safe(answer)
                     if err:
                         msg = f"{opt or 'disabled'}: parsing failed: {err}"
                         print(f"  Sample parsing failed: {err}")
@@ -641,8 +743,13 @@ def test_deaths_batch_gemini(
                     "systemInstruction": {"parts": [{"text": system_prompt}]}
                 }
             }
-            # Attach generationConfig and optionally thinkingConfig
-            gen_cfg = {"temperature": float(temperature), "maxOutputTokens": max_tokens}
+            # Attach generationConfig with structured output and optionally thinkingConfig
+            gen_cfg = {
+                "temperature": float(temperature),
+                "maxOutputTokens": max_tokens,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": STRUCTURED_SCHEMA
+            }
             if thinking_level is not None:
                 gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level.upper()}
             request_obj["request"]["generationConfig"] = gen_cfg
@@ -723,7 +830,7 @@ def test_deaths_batch_gemini(
                                     answer = part['text'].strip()
                                     break
                             
-                            knows_death, error = parse_yes_no_response_safe(answer)
+                            knows_death, error = parse_structured_response_safe(answer)
                             if error:
                                 result_map[str(idx)] = (None, f"{answer} (parse error: {error})")
                             else:
