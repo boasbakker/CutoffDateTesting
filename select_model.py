@@ -320,11 +320,68 @@ def _classify_google(model_id):
     """
     Classify a Google model ID into (series, level).
 
-    Series: 'Gemini 1.x', 'Gemini 2.x', 'Gemini 3.x', 'Other'
-    Level:  'flash-lite', 'flash', 'pro', 'nano', 'other'
+    Series examples:
+      Gemini 2.x, Gemini 3.x, Gemini (latest), Gemma 3.x,
+      Deep Research, Nano Banana, Gemini Robotics
+    Level examples:
+      flash-lite, flash, pro, nano, experimental, computer-use,
+      1b, 4b, 12b, 27b, other
     """
     mid = model_id.lower()
 
+    # --- Deep Research ---
+    if 'deep-research' in mid:
+        level = 'pro' if 'pro' in mid else 'standard'
+        return 'Deep Research', level
+
+    # --- Nano Banana (image generation) ---
+    if 'nano-banana' in mid:
+        level = 'pro' if 'pro' in mid else 'standard'
+        return 'Nano Banana', level
+
+    # --- Gemma (open-weight) models ---
+    if mid.startswith('gemma'):
+        # gemma-3n-e2b-it → Gemma 3.x / nano-2b
+        # gemma-3-27b-it  → Gemma 3.x / 27b
+        ver_match = re.search(r'gemma-?(\d+)', mid)
+        major = int(ver_match.group(1)) if ver_match else 0
+        series = f'Gemma {major}.x' if major else 'Gemma (other)'
+
+        if 'gemma-3n' in mid or 'gemma3n' in mid:
+            # Nano variant — extract parameter count
+            size_match = re.search(r'e(\d+)b', mid)
+            level = f'nano-{size_match.group(1)}b' if size_match else 'nano'
+        else:
+            size_match = re.search(r'(\d+)b', mid)
+            level = f'{size_match.group(1)}b' if size_match else 'other'
+        return series, level
+
+    # --- Gemini Robotics ---
+    if 'gemini-robotics' in mid:
+        ver_match = re.search(r'(\d+(?:\.\d+)?)', mid)
+        version = ver_match.group(1) if ver_match else ''
+        return 'Gemini Robotics', version or 'other'
+
+    # --- Gemini experimental (gemini-exp-MMDD) ---
+    if re.match(r'^gemini-exp', mid):
+        # gemini-exp-1206 is an experimental Gemini 2.0 model
+        return 'Gemini 2.x', 'experimental'
+
+    # --- Gemini latest aliases (gemini-flash-latest, gemini-pro-latest) ---
+    if re.match(r'^gemini-(flash-lite|flash|pro|nano)-latest$', mid):
+        if 'flash-lite' in mid:
+            level = 'flash-lite'
+        elif 'flash' in mid:
+            level = 'flash'
+        elif 'pro' in mid:
+            level = 'pro'
+        elif 'nano' in mid:
+            level = 'nano'
+        else:
+            level = 'other'
+        return 'Gemini (latest)', level
+
+    # --- Standard Gemini versioned models ---
     if 'gemini' in mid:
         ver_match = re.search(r'gemini[- ]?(\d+)', mid)
         if ver_match:
@@ -333,12 +390,25 @@ def _classify_google(model_id):
         else:
             series = 'Gemini (other)'
 
-        if 'flash-lite' in mid or 'flash_lite' in mid:
+        # Determine level/tier
+        if 'computer-use' in mid or 'computer_use' in mid:
+            level = 'computer-use'
+        elif 'flash-lite' in mid or 'flash_lite' in mid:
             level = 'flash-lite'
         elif 'flash' in mid:
-            level = 'flash'
+            if 'image' in mid:
+                level = 'flash-image'
+            elif 'tts' in mid:
+                level = 'flash-tts'
+            else:
+                level = 'flash'
         elif 'pro' in mid:
-            level = 'pro'
+            if 'image' in mid:
+                level = 'pro-image'
+            elif 'tts' in mid:
+                level = 'pro-tts'
+            else:
+                level = 'pro'
         elif 'nano' in mid:
             level = 'nano'
         else:
