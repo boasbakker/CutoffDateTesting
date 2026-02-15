@@ -103,69 +103,115 @@ def keypress_select(options, prompt_title="Select an option"):
 
 # ---------------------------------------------------------------------------
 # Model fetching — one function per provider
+# Each returns only text→text models, filtered using API-provided metadata.
 # ---------------------------------------------------------------------------
 
-# OpenAI model ID prefixes/suffixes that are NOT text→text
-_OPENAI_EXCLUDE_PREFIXES = ('dall-e', 'tts-', 'whisper-', 'text-embedding', 'sora-', 'omni-moderation')
-_OPENAI_EXCLUDE_SUFFIXES = ('-tts', '-transcribe', '-realtime', '-image')
-_OPENAI_EXCLUDE_CONTAINS = ('-tts-', '-transcribe-', '-realtime-', '-audio', '-image-', 'chatgpt-image')
+def _probe_openai_chat(client, model_id):
+    """
+    Probe whether an OpenAI model supports text→text generation.
 
+    Tries chat completions first, then falls back to the Responses API
+    for models that only support v1/responses (e.g. gpt-5-pro, o1-pro).
+    Returns True if either endpoint works, False otherwise.
+    """
+    msg = [{"role": "user", "content": "hi"}]
 
-def _is_openai_text_model(model_id):
-    """Return True if an OpenAI model ID is a text→text model (not image/audio/embedding/moderation)."""
-    mid = model_id.lower()
-    for prefix in _OPENAI_EXCLUDE_PREFIXES:
-        if mid.startswith(prefix):
-            return False
-    for suffix in _OPENAI_EXCLUDE_SUFFIXES:
-        if mid.endswith(suffix):
-            return False
-    for pattern in _OPENAI_EXCLUDE_CONTAINS:
-        if pattern in mid:
-            return False
-    return True
+    # Errors that indicate the model DOES support chat, it just hit a limit
+    CHAT_SUPPORT_HINTS = ["max_tokens", "max_completion_tokens", "output limit"]
+
+    def _is_limit_error(error_str):
+        """Check if error indicates model supports chat but hit token limit."""
+        return any(hint in error_str for hint in CHAT_SUPPORT_HINTS)
+
+    def _try_responses_api():
+        """Try the Responses API (v1/responses) as a fallback."""
+        try:
+            client.responses.create(
+                model=model_id,
+                input="hi",
+                max_output_tokens=2,
+            )
+            return True
+        except Exception as e2:
+            return _is_limit_error(str(e2).lower())
+
+    # Try chat completions first (max_completion_tokens for newer models)
+    try:
+        client.chat.completions.create(
+            model=model_id, messages=msg, max_completion_tokens=2
+        )
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if _is_limit_error(err):
+            return True
+        # Model is responses-only → try that API
+        if "not supported" in err or "v1/responses" in err:
+            return _try_responses_api()
+        # Parameter name error → retry with old parameter name
+        if "unsupported_parameter" in err:
+            try:
+                client.chat.completions.create(
+                    model=model_id, messages=msg, max_tokens=2
+                )
+                return True
+            except Exception as e2:
+                err2 = str(e2).lower()
+                if _is_limit_error(err2):
+                    return True
+                if "not supported" in err2 or "v1/responses" in err2:
+                    return _try_responses_api()
+                return False
+        return False
 
 
 def _fetch_openai_models():
-    """Fetch text→text model IDs from OpenAI (excludes image/audio/embedding/moderation models)."""
+    """
+    Fetch text→text model IDs from OpenAI.
+
+    OpenAI's list endpoint provides no capability metadata, so we probe each
+    model with a minimal chat completion call to check support. Uses
+    concurrent threads for speed.
+    """
     from openai import OpenAI
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     client = OpenAI()
-    models = client.models.list()
-    return sorted(m.id for m in models if _is_openai_text_model(m.id))
+    all_models = sorted(m.id for m in client.models.list())
 
-
-# Google model name patterns that are NOT text→text
-_GOOGLE_EXCLUDE_CONTAINS = ('imagen', 'veo-', 'embedding', '-tts', 'native-audio', '-image')
-
-
-def _is_google_text_model(model):
-    """Return True if a Google model supports text→text generation (based on supported_actions and name)."""
-    actions = model.supported_actions or []
-    name = (model.name or '').lower()
-    # Must support generateContent (the standard text generation action)
-    if 'generateContent' not in actions:
-        return False
-    # Exclude models that only have bidiGenerateContent (live/streaming audio)
-    if 'bidiGenerateContent' in actions and 'createCachedContent' not in actions:
-        return False
-    # Exclude by name patterns
-    for pattern in _GOOGLE_EXCLUDE_CONTAINS:
-        if pattern in name:
-            return False
-    # Exclude the special 'aqa' model (question-answering only)
-    if name.endswith('/aqa') or name == 'aqa':
-        return False
-    return True
+    print(f"  Probing {len(all_models)} models for chat support...")
+    text_models = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {
+            pool.submit(_probe_openai_chat, client, mid): mid
+            for mid in all_models
+        }
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            mid = futures[future]
+            if future.result():
+                text_models.append(mid)
+            # Progress indicator
+            print(f"\r  Probed {done_count}/{len(all_models)} models...", end="", flush=True)
+    print()  # newline after progress
+    return sorted(text_models)
 
 
 def _fetch_google_models():
-    """Fetch text→text model IDs from Google (excludes image/video/embedding/audio-only models)."""
+    """
+    Fetch text→text model IDs from Google Gemini.
+
+    Uses the `supported_actions` metadata field to filter for models that
+    support `generateContent` (i.e. text generation).
+    """
     from google import genai
     client = genai.Client(api_key=os.environ.get('GOOGLE_API_KEY'))
-    models = list(client.models.list())
     ids = []
-    for m in models:
-        if not _is_google_text_model(m):
+    for m in client.models.list():
+        # Only include models that support text generation
+        actions = getattr(m, 'supported_actions', None) or []
+        if 'generateContent' not in actions:
             continue
         name = m.name
         if name.startswith('models/'):
@@ -175,7 +221,12 @@ def _fetch_google_models():
 
 
 def _fetch_anthropic_models():
-    """Fetch all model IDs from Anthropic. Returns a sorted list of model ID strings."""
+    """
+    Fetch text→text model IDs from Anthropic.
+
+    All models returned by Anthropic's list endpoint are chat models
+    (text→text), so no additional filtering is needed.
+    """
     import anthropic
     client = anthropic.Anthropic()
     result = client.models.list()
