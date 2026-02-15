@@ -873,6 +873,155 @@ def get_versioned_output_filename(base_output: str, mode: str) -> str:
     return f"{base}_{mode}_v{SCRIPT_VERSION}{ext}"
 
 
+def process_existing_file(input_file: str, output_file: str, mode: str = 'after'):
+    """
+    Read an existing CSV file, update pageviews and birth dates, and save to a new file.
+    Preserves existing columns and adds/updates 'birth_date' and 'pageviews'.
+    Supports incremental saving and resuming.
+    """
+    print(f"Processing existing file: {input_file}")
+    
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' not found.")
+        return
+
+    # Read all input entries
+    input_entries = []
+    with open(input_file, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames) # Copy fieldnames
+        for row in reader:
+            input_entries.append(row)
+            
+    # Ensure new columns are in fieldnames
+    if 'birth_date' not in fieldnames:
+         fieldnames.append('birth_date')
+    if 'pageviews' not in fieldnames:
+         fieldnames.append('pageviews')
+
+    print(f"Loaded {len(input_entries)} entries from input.")
+    
+    # Check for existing output to resume
+    processed_count = 0
+    processed_keys = set()
+    file_exists = os.path.exists(output_file)
+    
+    if file_exists:
+        with open(output_file, 'r', newline='', encoding='utf-8') as f:
+            # Check if file is empty
+            f.seek(0, 2) # Go to end
+            if f.tell() > 0:
+                f.seek(0)
+                try:
+                    out_reader = csv.DictReader(f)
+                    for row in out_reader:
+                        # Use name + death_date as unique key
+                        key = (row.get('name'), row.get('death_date'))
+                        processed_keys.add(key)
+                        processed_count += 1
+                except ValueError:
+                    # File might be corrupted or just header
+                    pass
+    
+    print(f"Found {processed_count} already processed entries. Resuming...")
+    
+    # Filter entries to process
+    entries_to_process = []
+    for entry in input_entries:
+        key = (entry.get('name'), entry.get('death_date'))
+        if key not in processed_keys:
+            entries_to_process.append(entry)
+            
+    if not entries_to_process:
+        print("All entries already processed!")
+        return
+
+    print(f"Remaining entries to process: {len(entries_to_process)}")
+    
+    # Process in batches
+    BATCH_SIZE = 50
+    total_processed = 0
+    total_skipped = 0
+    
+    # Open output file in append mode
+    # If file didn't exist, DictWriter will just write, but we need to handle header manually if not exists
+    mode_flag = 'a' if file_exists else 'w'
+    with open(output_file, mode_flag, newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        if not file_exists:
+            writer.writeheader()
+            
+        for i in range(0, len(entries_to_process), BATCH_SIZE):
+            batch = entries_to_process[i:i+BATCH_SIZE]
+            
+            # Prepare article entries for this batch
+            article_batch = []
+            valid_batch_indices = [] # Track which input items correspond to valid articles
+            
+            for idx, entry in enumerate(batch):
+                 title = entry.get('article_title') or entry.get('name')
+                 try:
+                    death_date = datetime.strptime(entry.get('death_date', ''), '%Y-%m-%d')
+                    article_batch.append({
+                        'article_title': title,
+                        'death_date': death_date,
+                        'original_entry': entry
+                    })
+                    valid_batch_indices.append(idx)
+                 except ValueError:
+                    print(f"  Skipping entry {entry.get('name')}: Invalid date")
+                    total_skipped += 1
+            
+            if not article_batch:
+                continue
+                
+            # Fetch data for batch
+            print(f"  Processing batch {i//BATCH_SIZE + 1} ({len(article_batch)} items)...")
+            
+            # 1. Pageviews
+            pageview_counts = get_pageviews_for_articles(article_batch, mode=mode)
+            
+            # 2. Birth Dates
+            titles = [e['article_title'] for e in article_batch]
+            birth_dates_map = get_birth_dates_for_articles(titles)
+            
+            # Update and write
+            batch_to_write = []
+            for item in article_batch:
+                original = item['original_entry']
+                title = item['article_title']
+                
+                # Update info (allow partials, or keep strict?)
+                # User asked for edit mode to update fields. 
+                # If strict, we skip rows that fail. If lenient, we write what we have.
+                # Previous implementation was strict. Stick to strict for now to avoid bad data.
+                
+                views = pageview_counts.get(title, 0)
+                bdate = birth_dates_map.get(title)
+                
+                if views == -1:
+                    print(f"    Skipping '{title}': Page not found")
+                    total_skipped += 1
+                    continue
+                    
+                if not bdate:
+                    print(f"    Skipping '{title}': Birth date not found")
+                    total_skipped += 1
+                    continue
+                    
+                original['pageviews'] = views
+                original['birth_date'] = bdate
+                batch_to_write.append(original)
+            
+            if batch_to_write:
+                writer.writerows(batch_to_write)
+                f.flush() # Ensure written to disk
+                total_processed += len(batch_to_write)
+                print(f"    Saved {len(batch_to_write)} entries.")
+    
+    print(f"Done. Processed {total_processed}, Skipped {total_skipped}.")
+
+
 def save_to_csv(deaths: List[Dict], output_file: str):
     """
     Save the deaths data to a CSV file (final save, sorts all data).
@@ -900,8 +1049,13 @@ def main():
     parser.add_argument(
         '--start', 
         type=str, 
-        default='2024-01-01',
-        help='Start date in YYYY-MM-DD format (default: 2024-01-01)'
+        default='2020-01-01',
+        help='Start date in YYYY-MM-DD format (default: 2020-01-01)'
+    )
+    parser.add_argument(
+        '--input',
+        type=str,
+        help='Input CSV file to update (edit mode). If provided, fetching from Wikipedia is skipped.'
     )
     parser.add_argument(
         '--end', 
@@ -919,11 +1073,27 @@ def main():
         '--mode', 
         type=str, 
         choices=['before', 'after'],
-        default='after',
-        help='Pageview counting mode: "after" (default, 60 days starting 1 day before death) or "before" (60 days ending 6 days before death)'
+        default='before',
+        help='Pageview counting mode: "after" (60 days starting 1 day before death) or "before" (default, 60 days ending 6 days before death)'
     )
     args = parser.parse_args()
     
+    print(f"Script version: {SCRIPT_VERSION}")
+    print(f"Mode: {args.mode.upper()}")
+    
+    # EDIT MODE: Process existing file
+    if args.input:
+        if args.output == 'deaths_data.csv':
+             # Default output name based on input
+             base, ext = os.path.splitext(args.input)
+             output_file = f"{base}_updated_{args.mode}{ext}"
+        else:
+             output_file = args.output
+             
+        process_existing_file(args.input, output_file, mode=args.mode)
+        return
+
+    # REGULAR MODE: Fetch from Wikipedia
     try:
         start_date = datetime.strptime(args.start, '%Y-%m-%d')
         end_date = datetime.strptime(args.end, '%Y-%m-%d')
@@ -938,7 +1108,6 @@ def main():
     # Generate versioned output filename
     output_file = get_versioned_output_filename(args.output, args.mode)
     
-    print(f"Script version: {SCRIPT_VERSION}")
     print(f"Output file: {output_file}")
     print(f"Fetching ALL deaths from {args.start} to {args.end}")
     print(f"Mode: {args.mode.upper()}")
