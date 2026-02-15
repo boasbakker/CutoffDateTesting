@@ -15,7 +15,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Script version - increment this when making changes to force new output file
-SCRIPT_VERSION = "1.0"
+SCRIPT_VERSION = "1.2"
 
 # Global headers for Wikipedia API requests
 WIKI_HEADERS = {
@@ -23,33 +23,64 @@ WIKI_HEADERS = {
 }
 
 
-def get_pageviews_sum(article_title: str, death_date: datetime) -> int:
+def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'after') -> int:
     """
-    Get total pageviews for an article from 1 day before death up to 60 days after.
-    Uses Wikimedia Pageviews REST API.
+    Get total pageviews for an article.
+    mode='after': 1 day before death up to 60 days after (death incl. margin).
+    mode='before': 60 days ending 6 days before death (death excl. margin).
+    
     Returns -1 if the page doesn't exist (404).
     """
     # Pageviews API expects underscores instead of spaces
     safe_title = article_title.replace(' ', '_')
-    start = (death_date - timedelta(days=1)).strftime('%Y%m%d')
-    # End is inclusive; use +58 to cover 60 days total (1 day before + 59 days after)
-    end = (death_date + timedelta(days=58)).strftime('%Y%m%d')
+    
+    if mode == 'after':
+        # Start: 1 day before death
+        # End: 60 days total duration
+        start_dt = death_date - timedelta(days=1)
+        end_dt = start_dt + timedelta(days=60)
+    else: # mode == 'before'
+        # End: 6 days before death (to avoid illness/hospice spikes)
+        # Start: 60 days duration backwards
+        end_dt = death_date - timedelta(days=6)
+        start_dt = end_dt - timedelta(days=60)
+        
+    start = start_dt.strftime('%Y%m%d')
+    end = end_dt.strftime('%Y%m%d')
+    
     url = (
         "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
         f"en.wikipedia.org/all-access/user/{safe_title}/daily/{start}/{end}"
     )
-    resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
-    if resp.status_code == 404:
-        return -1  # Page not found - article doesn't exist
-    resp.raise_for_status()
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
+            if resp.status_code == 429:
+                # Rate limit hit, wait and retry
+                time.sleep(2 * (attempt + 1))
+                continue
+            if resp.status_code == 404:
+                return -1  # Page not found - article doesn't exist
+            resp.raise_for_status()
+            break
+        except requests.exceptions.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(1)
+            
+    if not resp:
+        return 0
+        
     data = resp.json()
     return sum(item.get('views', 0) for item in data.get('items', []))
 
 
-def get_pageviews_for_articles(article_entries: List[Dict], max_workers: int = 20) -> Dict[str, int]:
+def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 2) -> Dict[str, int]:
     """
     Compute pageviews for multiple articles using parallel requests.
     article_entries: list of dicts with 'article_title' and 'death_date' (datetime).
+    mode: 'before' or 'after'
     Returns mapping article_title -> pageviews_sum.
     """
     if not article_entries:
@@ -62,7 +93,8 @@ def get_pageviews_for_articles(article_entries: List[Dict], max_workers: int = 2
     def fetch_one(entry: Dict) -> tuple:
         title = entry['article_title']
         death_dt = entry['death_date']
-        return title, get_pageviews_sum(title, death_dt)
+        time.sleep(0.2) # Throttle requests
+        return title, get_pageviews_sum(title, death_dt, mode=mode)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_one, entry): entry for entry in article_entries}
@@ -73,6 +105,176 @@ def get_pageviews_for_articles(article_entries: List[Dict], max_workers: int = 2
             print(f"    Pageviews: {completed}/{total}", end="\r")
     
     print()  # finish line
+    return results
+
+
+def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> Dict[str, str]:
+    """
+    Fetch strict birth dates (YYYY-MM-DD) for a list of articles using Wikidata.
+    Two-step process:
+    1. Wikipedia API: Get Wikidata QID for each article (handles redirects).
+    2. Wikidata API: Get 'Date of Birth' (P569) for each QID.
+    
+    Returns mapping: article_title -> birth_date_string (YYYY-MM-DD)
+    Only includes entries where a FULL birth date is found.
+    """
+    if not articles:
+        return {}
+        
+    print(f"  Fetching birth dates for {len(articles)} articles from Wikidata...")
+    
+    # Session for connection pooling
+    session = requests.Session()
+    session.headers.update(WIKI_HEADERS)
+    
+    # Step 1: Get QIDs in chunks of 50
+    article_to_qid = {}
+    chunk_size = 50
+    
+    for i in range(0, len(articles), chunk_size):
+        chunk = articles[i:i+chunk_size]
+        url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "format": "json",
+            "titles": "|".join(chunk),
+            "prop": "pageprops",
+            "ppprop": "wikibase_item",
+            "redirects": "1"
+        }
+        
+        success = False
+        for attempt in range(3):
+            try:
+                resp = session.get(url, params=params, timeout=30)
+                if resp.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                success = True
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"    Error fetching QIDs for chunk: {e}")
+                time.sleep(1)
+        
+        if not success:
+            continue
+            
+        # Parse data...
+        pages = data.get("query", {}).get("pages", {})
+        
+        # Create a map of normalized/redirected titles to QIDs
+        redirect_map = {}
+        if "query" in data:
+            if "redirects" in data["query"]:
+                for r in data["query"]["redirects"]:
+                    redirect_map[r["to"]] = r["from"]
+            if "normalized" in data["query"]:
+                for n in data["query"]["normalized"]:
+                    redirect_map[n["to"]] = n["from"]
+        
+        for page_id, page in pages.items():
+            if "missing" in page or "pageprops" not in page:
+                continue
+                
+            title = page.get("title")
+            qid = page.get("pageprops", {}).get("wikibase_item")
+            
+            if not qid:
+                continue
+            
+            # 1. Direct match
+            if title in chunk:
+                article_to_qid[title] = qid
+            # 2. Mapped match (redirect target -> original)
+            elif title in redirect_map:
+                original = redirect_map[title]
+                if original in chunk:
+                        article_to_qid[original] = qid
+        
+        # Polite delay between chunks
+        time.sleep(0.5)
+            
+    # Step 2: Get Birth Dates from Wikidata for collected QIDs
+    results = {}
+    qids = list(set(article_to_qid.values()))
+    qid_to_birthdate = {}
+    
+    for i in range(0, len(qids), chunk_size):
+        chunk_qids = qids[i:i+chunk_size]
+        url = "https://www.wikidata.org/w/api.php"
+        params = {
+            "action": "wbgetentities",
+            "format": "json",
+            "ids": "|".join(chunk_qids),
+            "props": "claims",
+            "languages": "en" 
+        }
+        
+        success = False
+        for attempt in range(3):
+            try:
+                resp = session.get(url, params=params, timeout=30)
+                if resp.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                success = True
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"    Error fetching Wikidata claims for chunk: {e}")
+                time.sleep(1)
+
+        if not success:
+            continue
+            
+        entities = data.get("entities", {})
+        for qid, entity in entities.items():
+            if "claims" not in entity:
+                continue
+            
+            # P569: Date of Birth
+            birth_claims = entity["claims"].get("P569", [])
+            if not birth_claims:
+                continue
+            
+            for claim in birth_claims:
+                mainsnak = claim.get("mainsnak", {})
+                datavalue = mainsnak.get("datavalue", {})
+                if not datavalue: continue
+                
+                value = datavalue.get("value", {})
+                if not isinstance(value, dict): continue
+                
+                # Precision: 11 = day
+                precision = value.get("precision", 0)
+                time_str = value.get("time", "")
+                
+                if precision >= 11 and time_str:
+                    # Format is typically "+1946-06-14T00:00:00Z"
+                    if time_str.startswith('+'):
+                        clean_time = time_str[1:]
+                    else:
+                        clean_time = time_str
+                        
+                    # Extract first 10 chars: YYYY-MM-DD
+                    if len(clean_time) >= 10:
+                        birth_date = clean_time[:10]
+                        qid_to_birthdate[qid] = birth_date
+                        break 
+                            
+    # Map back: Article -> QID -> Birth Date
+    count = 0
+    for article, qid in article_to_qid.items():
+        if qid in qid_to_birthdate:
+            results[article] = qid_to_birthdate[qid]
+            count += 1
+            
+    print(f"  Found full birth dates for {count}/{len(articles)} articles")
     return results
 
 
@@ -522,16 +724,17 @@ def fetch_deaths_for_month(year: int, month: int) -> List[Dict]:
     return deaths
 
 
-def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output_file: str) -> List[Dict]:
+def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output_file: str, mode: str = 'after') -> List[Dict]:
     """
     Fetch deaths for a range of dates by fetching monthly pages.
-    Exports ALL deaths with their pageview counts (60 days after death).
+    Exports ALL deaths with their pageview counts.
     Writes to CSV live and supports resuming from existing file.
     
     Args:
         start_date: Start of date range
         end_date: End of date range
         output_file: Path to output CSV file
+        mode: 'before' or 'after'
     """
     all_deaths = []
     completed_months: Set[Tuple[int, int]] = set()
@@ -601,27 +804,42 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
                     })
 
             # Get pageview counts for all articles in this month (parallel requests)
-            print(f"  Fetching pageview counts for {len(all_article_entries)} articles...")
-            pageview_counts = get_pageviews_for_articles(all_article_entries)
+            print(f"  Fetching pageview counts ({mode} mode) for {len(all_article_entries)} articles...")
+            pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode)
 
-            # Add pageview count to each death record and collect all
-            # Skip entries where article doesn't exist (pageviews == -1)
+            # NEW: Get birth dates for all articles (strict filtering)
+            article_titles = [entry['article_title'] for entry in all_article_entries]
+            birth_dates_map = get_birth_dates_for_articles(article_titles)
+
+            # Add pageview count and birth date to each death record
+            # Apply STRICT FILTERING: Must have pageviews (article exists) AND full birth date
             skipped_no_article = 0
+            skipped_bad_date = 0
+            
             for day_key in sorted(deaths_by_day.keys()):
                 for death in deaths_by_day[day_key]:
                     views = pageview_counts.get(death['article_title'], 0)
                     if views == -1:
                         # Article doesn't exist in English Wikipedia
-                        print(f"  WARNING: Skipping '{death['name']}' - no English Wikipedia article")
                         skipped_no_article += 1
                         continue
+                        
+                    # 2. Check Birth Date (Strict Filtering)
+                    bdate = birth_dates_map.get(death['article_title'])
+                    if not bdate:
+                        skipped_bad_date += 1
+                        continue
+
                     death['pageviews'] = views
+                    death['birth_date'] = bdate
                     death.pop('article_title', None)  # Remove helper field
                     month_deaths.append(death)
                     all_deaths.append(death)
             
             if skipped_no_article > 0:
                 print(f"  Skipped {skipped_no_article} entries with no English Wikipedia article")
+            if skipped_bad_date > 0:
+                print(f"  Skipped {skipped_bad_date} entries with missing/incomplete birth date")
         
         # Write this month's deaths to CSV immediately
         if month_deaths:
@@ -629,7 +847,8 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             month_deaths.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
             
             with open(output_file, 'a' if file_exists else 'w', newline='', encoding='utf-8') as f:
-                fieldnames = ['name', 'death_date', 'description', 'pageviews']
+                fieldnames = ['name', 'death_date', 'birth_date', 'description', 'pageviews']
+                # Updated fieldnames
                 writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
                 if not file_exists:
                     writer.writeheader()
@@ -645,13 +864,13 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
     return all_deaths
 
 
-def get_versioned_output_filename(base_output: str) -> str:
+def get_versioned_output_filename(base_output: str, mode: str) -> str:
     """
-    Generate output filename with version number.
-    E.g., 'deaths_data.csv' -> 'deaths_data_v1.0.csv'
+    Generate output filename with version number and mode.
+    E.g., 'deaths_data.csv' -> 'deaths_data_after_v1.2.csv'
     """
     base, ext = os.path.splitext(base_output)
-    return f"{base}_v{SCRIPT_VERSION}{ext}"
+    return f"{base}_{mode}_v{SCRIPT_VERSION}{ext}"
 
 
 def save_to_csv(deaths: List[Dict], output_file: str):
@@ -666,7 +885,7 @@ def save_to_csv(deaths: List[Dict], output_file: str):
     deaths.sort(key=lambda x: (x['death_date'], -int(x.get('pageviews', 0))))
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['name', 'death_date', 'description', 'pageviews']
+        fieldnames = ['name', 'death_date', 'birth_date', 'description', 'pageviews']
         writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
         writer.writerows(deaths)
@@ -694,7 +913,14 @@ def main():
         '--output', 
         type=str, 
         default='deaths_data.csv',
-        help='Output CSV file base name (default: deaths_data.csv). Version will be appended.'
+        help='Output CSV file base name (default: deaths_data.csv). Mode and version will be appended.'
+    )
+    parser.add_argument(
+        '--mode', 
+        type=str, 
+        choices=['before', 'after'],
+        default='after',
+        help='Pageview counting mode: "after" (default, 60 days starting 1 day before death) or "before" (60 days ending 6 days before death)'
     )
     args = parser.parse_args()
     
@@ -710,15 +936,19 @@ def main():
         return
     
     # Generate versioned output filename
-    output_file = get_versioned_output_filename(args.output)
+    output_file = get_versioned_output_filename(args.output, args.mode)
     
     print(f"Script version: {SCRIPT_VERSION}")
     print(f"Output file: {output_file}")
     print(f"Fetching ALL deaths from {args.start} to {args.end}")
-    print("Pageviews will be fetched for each person (60 days after death)")
+    print(f"Mode: {args.mode.upper()}")
+    if args.mode == 'after':
+        print("Pageviews: 60 days starting 1 day before death (includes death spike)")
+    else:
+        print("Pageviews: 60 days ending 6 days before death (baseline fame)")
     print("=" * 50)
     
-    deaths = fetch_deaths_for_date_range(start_date, end_date, output_file)
+    deaths = fetch_deaths_for_date_range(start_date, end_date, output_file, mode=args.mode)
     
     # Final sort and save (to ensure proper ordering after resume)
     if deaths:
