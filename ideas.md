@@ -1,4 +1,3 @@
-- Structured output gebruiken voor Claude: dat forceert Ja/Nee? Misschien ook voor andere modellen
 - Detailbeeld van cutoff Gemini 3 Flash, test eerst goede views cutoff (zie jan 2022 document)
 - Gemini 3 pro / gpt-5 mini / gpt-5-nano / gpt-5.2 pro / oudere modellen testen. Dan eerst prompts vinden om reasoning uit te zetten, per model een aparte prompt maken. Ook testen of reasoning helpt is interessant later. 
 - Games, muziek, films, boeken met een release date is een alternatief voor overlijdensberichten. Maar wel minder goed: die dingen worden van tevoren aangekondigd

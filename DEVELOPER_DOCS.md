@@ -8,9 +8,9 @@ This project tests LLM knowledge cutoff dates by querying whether deceased peopl
 
 - Fetch death records from Wikipedia with pageview data
 - Query multiple LLM providers (OpenAI, Claude, Gemini) about whether the person is still alive
-- Use structured outputs (JSON with boolean `answer` field) to force deterministic Yes/No answers
+- Use structured outputs (JSON with boolean `answer` field) to force deterministic Yes/No answers (native or fallback)
 - Support batch APIs for Claude and Gemini, sequential/flex for OpenAI
-- Support reasoning/thinking modes for all providers
+- Support reasoning/thinking modes for all providers (simplified prompt strategy)
 - Filter deaths by pageviews (top per day/month, minimum views)
 - Export results to CSV for analysis
 - Generate accuracy-over-time plots and statistics
@@ -37,7 +37,9 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 | File | Lines | Purpose |
 |------|-------|---------|
 | `fetch_deaths_wikipedia.py` | ~737 | Fetches deaths from Wikipedia API, parses wikitext, gets pageviews, exports to CSV |
-| `query_llm.py` | ~1022 | Queries LLMs (OpenAI/Claude/Gemini) about deaths, uses structured outputs, exports results CSV |
+| `query_llm.py` | ~150 | Entry point to query LLMs. Selects provider and executes tests. |
+| `config.py` | ~50 | Global configuration constants (API keys, prompts, tokens). |
+| `llm_providers.py` | ~300 | LLM Provider implementations (OpenAI, Claude, Gemini). |
 | `process_results.py` | ~454 | Generates accuracy statistics by date/month/pageviews, produces plots |
 | `process_results_monthly.py` | ~270 | Monthly accuracy analysis with trend lines, cleaner axis labels |
 | `select_model.py` | ~270 | Interactive model selector: provider → series → level → version via single-keypress input. Importable (`from select_model import select_model`) or standalone. |
@@ -72,7 +74,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 | `ANTHROPIC_API_KEY` | Anthropic | `claude-*` models |
 | `GOOGLE_API_KEY` | Google | `gemini-*` models |
 
-### Key Constants in `query_llm.py`
+### Key Constants in `config.py`
 
 | Constant | Value | Description |
 |----------|-------|-------------|
@@ -81,7 +83,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 | `MAX_TOKENS_CLAUDE` | 2 | Max output tokens for Claude |
 | `MAX_TOKENS_GEMINI_MINIMAL` | 5 | Max output tokens for Gemini (minimal thinking) |
 | `MAX_TOKENS_LOW_REASONING` | 200 | Max tokens when reasoning is enabled |
-| `SYSTEM_PROMPT` | `'Answer only "Yes" or "No"...'` | System prompt for non-reasoning mode |
+| `SYSTEM_PROMPT` | `"Answer 'Yes' or 'No'..."` | Standard system prompt (reasoning variant exists) |
 
 ### CLI Usage (`query_llm.py`)
 
@@ -109,14 +111,14 @@ python process_results_monthly.py --input results/<file>.csv [--min-samples <N>]
 ### Claude (Batch API)
 - Uses `client.messages.batches.create()` for batch processing
 - Structured output via `output_config.format` with `json_schema` (models ≥ 4.5)
-- Fallback for older 3.x models: response prefilling with `{"answer":` + stop sequence `}`
+- **Legacy Fallback**: For older 3.x models, uses response prefilling with `{"answer":` + stop sequence `}`
 - Extended thinking via `thinking` config with `budget_tokens`
-- Special system prompt includes "If unsure, answer 'Yes'" to reduce false positives
+- Uses simplified `SYSTEM_PROMPT` or `SYSTEM_PROMPT_REASONING` based on mode
 
 ### Gemini (Batch API with File-Based Input)
 - Uses JSONL file upload → batch job → file download for results
-- Structured output via `responseMimeType: "application/json"` + `responseJsonSchema`
-- Probes supported thinking levels via sample request before submitting batch
+- **Always uses structured outputs** via `responseMimeType: "application/json"` + `responseJsonSchema`
+- No longer uses probing; assumes model supports requested features
 - Results matched by `key` field in JSONL for reliable ordering
 
 ## Results CSV Format
