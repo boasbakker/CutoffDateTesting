@@ -268,8 +268,8 @@ def _classify_openai(model_id):
     """
     Classify an OpenAI model ID into (series, level).
 
-    Series: 'GPT-3.x', 'GPT-4.x', 'GPT-5.x', 'o-series', 'Other'
-    Level:  'mini', 'standard', 'pro', 'other'
+    Series: 'GPT-3.x (legacy)', 'GPT-4.x', 'GPT-5.x', 'o-series', 'Other'
+    Level:  'nano', 'mini', 'standard', 'pro', '4', '4o', '4.1', '5', '5.1', '5.2', …
     """
     mid = model_id.lower()
 
@@ -284,7 +284,7 @@ def _classify_openai(model_id):
             level = 'standard'
         return series, level
 
-    # GPT models
+    # GPT models (including chatgpt-* aliases)
     if 'gpt' in mid or mid in ('babbage-002', 'davinci-002'):
         # Determine major version
         ver_match = re.search(r'gpt-?(\d+)', mid)
@@ -304,10 +304,28 @@ def _classify_openai(model_id):
         else:
             series = 'GPT (other)'
 
-        if 'mini' in mid:
+        # Determine level/tier
+        if 'nano' in mid:
+            level = 'nano'
+        elif 'mini' in mid:
             level = 'mini'
         elif 'pro' in mid:
             level = 'pro'
+        elif major == 4:
+            # Subcategorize GPT-4.x standard: 4, 4o, 4.1
+            if '4o' in mid:
+                level = '4o'
+            elif '4.1' in mid:
+                level = '4.1'
+            else:
+                level = '4'
+        elif major >= 5:
+            # Subcategorize GPT-5+: 5, 5.1, 5.2, etc.
+            minor_match = re.search(r'gpt-?\d+\.(\d+)', mid)
+            if minor_match:
+                level = f'{major}.{minor_match.group(1)}'
+            else:
+                level = str(major)
         else:
             level = 'standard'
         return series, level
@@ -515,7 +533,7 @@ def select_model():
         series_groups[series].append((mid, level))
 
     series_options = [
-        (f"{s} ({len(models)} models)", s)
+        (models[0][0] if len(models) == 1 else f"{s} ({len(models)} models)", s)
         for s, models in sorted(series_groups.items())
     ]
     selected_series = keypress_select(series_options, "Select series")
@@ -531,7 +549,7 @@ def select_model():
 
     if len(level_groups) > 1:
         level_options = [
-            (f"{lvl} ({len(mids)} models)", lvl)
+            (mids[0] if len(mids) == 1 else f"{lvl} ({len(mids)} models)", lvl)
             for lvl, mids in sorted(level_groups.items())
         ]
         selected_level = keypress_select(level_options, "Select level/tier")
