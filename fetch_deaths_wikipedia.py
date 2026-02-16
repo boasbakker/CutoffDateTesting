@@ -36,7 +36,7 @@ class AdaptiveRateLimiter:
     Adaptive rate limiter using Additive Increase / Multiplicative Decrease (AIMD).
     Ensures gaps between requests to avoid bursts.
     """
-    def __init__(self, initial_rate=10, max_rate=20, min_rate=1, scale_up_interval=20):
+    def __init__(self, initial_rate=10, max_rate=15, min_rate=1, scale_up_interval=20):
         self.rate = initial_rate
         self.max_rate = max_rate
         self.min_rate = min_rate
@@ -1143,7 +1143,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
     for i, (year, month) in enumerate(months_to_process):
         # 0. Initialize Limiter for the whole run if not already present
         # (Though we mostly care about it within each month's pageview chunk)
-        limiter = AdaptiveRateLimiter(initial_rate=15, max_rate=20, min_rate=1)
+        limiter = AdaptiveRateLimiter(initial_rate=10, max_rate=15, min_rate=1)
 
         # 1. Fetch & Parse
         valid_deaths, pending_errors = fetch_deaths_for_month(year, month, mode=mode, defer_errors=True, limiter=limiter)
