@@ -324,7 +324,7 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
     total = len(article_entries)
     completed = 0
     
-    limiter = AdaptiveRateLimiter(initial_rate=15, max_rate=20, min_rate=1)
+    limiter = AdaptiveRateLimiter(initial_rate=10, max_rate=15, min_rate=1)
     
     def fetch_one(entry: Dict) -> tuple:
         title = entry['article_title']
