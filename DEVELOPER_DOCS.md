@@ -49,7 +49,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 
 | File | Purpose |
 |------|---------|
-| `deaths_data.csv` | All deaths with columns: `name`, `death_date`, `description`, `article_title`, `pageviews` |
+| `deaths_data.csv` | All deaths with columns: `name`, `article_title`, `death_date`, `birth_date`, `description`, `pageviews` |
 | `results/` | Output directory for results CSV files and plot images |
 
 ### Debug/Utility Scripts (gitignored)
@@ -132,7 +132,9 @@ python process_results_monthly.py --input results/<file>.csv [--min-samples <N>]
 | Column | Type | Description |
 |--------|------|-------------|
 | `name` | string | Person's name |
+| `article_title` | string | Wikipedia article title |
 | `death_date` | string | `YYYY-MM-DD` |
+| `birth_date` | string | `YYYY-MM-DD` |
 | `description` | string | Brief description from Wikipedia |
 | `pageviews` | int | Wikipedia pageviews (60 days after death) |
 | `llm_knows_death` | bool | `True` = model knows the person died |

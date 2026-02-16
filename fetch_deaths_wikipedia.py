@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Script version - increment this when making changes to force new output file
-SCRIPT_VERSION = "1.2"
+SCRIPT_VERSION = "1.3"
 
 # Global headers for Wikipedia API requests
 WIKI_HEADERS = {
@@ -323,12 +323,33 @@ def _parse_birth_date_from_infobox(article_title: str, session: requests.Session
     except Exception:
         return None
 
-    # Match {{birth date|YYYY|M|D...}} or {{Birth date and age|YYYY|M|D...}}
-    pattern = r'\{\{[Bb]irth[\s_]date(?:[\s_]and[\s_]age)?\|(\d{4})\|(\d{1,2})\|(\d{1,2})'
-    match = re.search(pattern, content)
-    if match:
-        year, month, day = match.group(1), match.group(2).zfill(2), match.group(3).zfill(2)
-        return f"{year}-{month}-{day}"
+    # Handle {{birth date}}, {{birth-date}}, {{Birth date and age}} etc.
+    # Use non-greedy match for content within {{ }}
+    # We look for templates starting with 'birth' followed by optional '-' or ' ' or '_' and 'date'
+    templates = re.findall(r'\{\{([Bb]irth[-_\s]date(?:[^{}]*))\}\}', content)
+    
+    for temp in templates:
+        parts = temp.split('|')
+        # Filter out named parameters (containing '=') and the template name itself
+        # named parameters like df=yes or born=yes are common
+        pos_params = [p.strip() for p in parts[1:] if '=' not in p and p.strip()]
+        
+        # Pick all digit-only positional params
+        num_params = [p for p in pos_params if p.isdigit()]
+        
+        # We expect at least Year, Month, Day
+        if len(num_params) >= 3:
+            year = num_params[0]
+            month = num_params[1].zfill(2)
+            day = num_params[2].zfill(2)
+            
+            # Basic validation: Year should be 4 digits (usually)
+            if len(year) == 4 and month.isdigit() and day.isdigit():
+                # Sanity check for month/day ranges
+                m_val = int(month)
+                d_val = int(day)
+                if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                    return f"{year}-{month}-{day}"
     return None
 
 
@@ -504,24 +525,29 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
             qid_to_low_precision.update(l)
             disambig_qids.update(d)
     
-    # Step 2b: Infobox fallback for low-precision Wikidata entries
-    low_prec_articles = [
-        a for a, q in article_to_qid.items() 
-        if q not in qid_to_birthdate and q in qid_to_low_precision
+    # Step 2b: Infobox fallback for missing or low-precision Wikidata entries
+    # Try infobox fallback for anything that didn't get a full date from Wikidata
+    fallback_articles = [
+        a for a in articles 
+        if a not in results and (article_to_qid.get(a) not in qid_to_birthdate)
     ]
-    if low_prec_articles:
-        print(f"  Trying infobox fallback for {len(low_prec_articles)} low-precision entries...")
+    
+    if fallback_articles:
+        print(f"  Trying infobox fallback for {len(fallback_articles)} missing or low-precision entries...")
         
         def fetch_infobox(art):
             return art, _parse_birth_date_from_infobox(art, session)
 
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(fetch_infobox, article) for article in low_prec_articles]
+            futures = [executor.submit(fetch_infobox, article) for article in fallback_articles]
             for future in as_completed(futures):
                 article, infobox_date = future.result()
                 if infobox_date:
                     results[article] = infobox_date
-                    # print(f"    Parsed birth date from infobox for '{article}': {infobox_date}")
+                    # Log to file if it wasn't on Wikidata (or had low precision)
+                    with open("infobox_birth_dates.log", "a", encoding="utf-8") as f:
+                        safe_title = article.replace(" ", "_")
+                        f.write(f"https://en.wikipedia.org/wiki/{safe_title}\n")
                     
     # Map back: Article -> QID -> Birth Date
     count = 0
@@ -821,11 +847,6 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         else:
             if silent: return None
             return handle_error(f"Invalid 2-character name (must be capital + lowercase): '{name}'", name, description)
-    
-    # Warn if name is just one word (most people have first and last name)
-    if len(name.split()) == 1:
-        if not silent:
-             print(msg_prefix().format('WARNING') + f"Name is only one word: '{name}'")
     
     # Now validate description
     
@@ -1178,6 +1199,10 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
                     deaths_to_save.append(d)
                     all_deaths.append(d)
             else:
+                # Add warning for high-view skips
+                views = d.get('pageviews', 0)
+                if views > 100000:
+                    print(f"  [!] WARNING: '{d['name']}' skipped (missing birth date) but has high views: {views:,}")
                 skipped_bad_date += 1
         
         if skipped_bad_date > 0:
@@ -1188,7 +1213,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             deaths_to_save.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
             
             with open(output_file, 'a' if file_exists else 'w', newline='', encoding='utf-8') as f:
-                fieldnames = ['name', 'death_date', 'birth_date', 'description', 'pageviews']
+                fieldnames = ['name', 'article_title', 'death_date', 'birth_date', 'description', 'pageviews']
                 writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
                 if not file_exists:
                     writer.writeheader()
@@ -1226,7 +1251,7 @@ def save_to_csv(deaths: List[Dict], output_file: str):
     deaths.sort(key=lambda x: (x['death_date'], -int(x.get('pageviews', 0))))
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['name', 'death_date', 'birth_date', 'description', 'pageviews']
+        fieldnames = ['name', 'article_title', 'death_date', 'birth_date', 'description', 'pageviews']
         writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
         writer.writerows(deaths)
