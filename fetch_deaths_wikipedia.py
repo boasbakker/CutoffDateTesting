@@ -10,7 +10,7 @@ import csv
 import time
 import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple, Union
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,8 +19,60 @@ SCRIPT_VERSION = "1.2"
 
 # Global headers for Wikipedia API requests
 WIKI_HEADERS = {
-    "User-Agent": "CutoffDateTesting/1.0 (Educational research project)"
+    "User-Agent": "CutoffDateTesting/1.0 (mailto:boasbakker123@gmail.com)"
 }
+
+
+def resolve_error_interactive(line: str, error_msg: str, year: int, month: int, day: int, 
+                            parsed_name: Optional[str] = None, parsed_description: Optional[str] = None, 
+                            parent_item: Optional[str] = None) -> Optional[Dict]:
+    """
+    Interactively resolve a parsing error with the user.
+    """
+    print(f"  ERROR: {error_msg}")
+    print(f"  Full line: {line}")
+    if parent_item:
+        print(f"  Parent: {parent_item}")
+    
+    skip = input("  Skip this person? (y/n, Enter=n): ").strip().lower()
+    if skip == 'y':
+        return None
+    
+    # Get name from user (suggest parsed name if available)
+    if parsed_name:
+        user_name = input(f"  Enter name (press Enter to keep '{parsed_name}'): ").strip()
+        if not user_name:
+            user_name = parsed_name
+    else:
+        user_name = input("  Enter name: ").strip()
+    
+    if not user_name:
+        print("  No name provided, skipping.")
+        return None
+    
+    # Get description
+    if parsed_description:
+        user_description = input(f"  Enter description (press Enter to keep '{parsed_description}'): ").strip()
+        if not user_description:
+            user_description = parsed_description
+    else:
+        user_description = input("  Enter description: ").strip()
+    
+    if not user_description:
+        print("  No description provided, skipping.")
+        return None
+    
+    try:
+        death_date = datetime(year, month, day)
+        return {
+            'name': user_name,
+            'article_title': user_name,  # Use name as article title for manual entries
+            'death_date': death_date.strftime('%Y-%m-%d'),
+            'description': user_description
+        }
+    except ValueError:
+        print(f"  Invalid date {year}-{month}-{day}, skipping.")
+        return None
 
 
 def get_page_creation_date(article_title: str) -> Optional[datetime]:
@@ -60,77 +112,6 @@ def get_page_creation_date(article_title: str) -> Optional[datetime]:
                 return None
             time.sleep(1)
     return None
-
-
-def resolve_redirects(titles: List[str]) -> Dict[str, str]:
-    """
-    Batch-resolve Wikipedia redirects for a list of article titles.
-    Returns mapping: original_title -> canonical_title.
-    Non-redirect titles map to themselves. Missing pages are omitted.
-    """
-    result = {}
-    chunk_size = 50
-    session = requests.Session()
-    session.headers.update(WIKI_HEADERS)
-
-    for i in range(0, len(titles), chunk_size):
-        chunk = titles[i:i+chunk_size]
-        params = {
-            "action": "query",
-            "titles": "|".join(chunk),
-            "redirects": "1",
-            "format": "json"
-        }
-        for attempt in range(3):
-            try:
-                resp = session.get("https://en.wikipedia.org/w/api.php",
-                                   params=params, timeout=30)
-                if resp.status_code == 429:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-
-                # Build normalized map: API-normalized title -> original title
-                norm_map = {}
-                for n in data.get("query", {}).get("normalized", []):
-                    norm_map[n["to"]] = n["from"]
-
-                # Build redirect map: redirect target -> redirect source
-                redir_map = {}
-                for r in data.get("query", {}).get("redirects", []):
-                    redir_map[r["to"]] = r["from"]
-
-                # Map each existing page back to the original title
-                pages = data.get("query", {}).get("pages", {})
-                for pid, page in pages.items():
-                    if "missing" in page:
-                        continue
-                    canonical = page["title"]
-
-                    # Trace back: canonical -> redirect source -> normalized source
-                    source = redir_map.get(canonical, canonical)
-                    source = norm_map.get(source, source)
-
-                    if source in chunk:
-                        result[source] = canonical
-
-                # Titles that weren't redirected map to themselves
-                for t in chunk:
-                    if t not in result:
-                        # Check if it exists (wasn't in missing pages)
-                        for pid, page in pages.items():
-                            if page.get("title") == t and "missing" not in page:
-                                result[t] = t
-                                break
-                break
-            except requests.exceptions.RequestException:
-                if attempt == 2:
-                    print(f"    Error resolving redirects for chunk")
-                time.sleep(1)
-        time.sleep(0.3)  # Polite delay
-
-    return result
 
 
 def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime) -> int:
@@ -202,7 +183,7 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
     return 0
 
 
-def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 2) -> Dict[str, int]:
+def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 10) -> Dict[str, int]:
     """
     Compute pageviews for multiple articles using parallel requests.
     article_entries: list of dicts with 'article_title' and 'death_date' (datetime).
@@ -219,7 +200,7 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
     def fetch_one(entry: Dict) -> tuple:
         title = entry['article_title']
         death_dt = entry['death_date']
-        time.sleep(0.2) # Throttle requests
+        # No artificial sleep here, rely on worker limit and retry logic in get_pageviews_sum
         return title, get_pageviews_sum(title, death_dt, mode=mode)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -228,7 +209,8 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
             title, views = future.result()
             results[title] = views
             completed += 1
-            print(f"    Pageviews: {completed}/{total}", end="\r")
+            if completed % 10 == 0 or completed == total:
+                print(f"    Pageviews: {completed}/{total}", end="\r")
     
     print()  # finish line
     return results
@@ -456,12 +438,17 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
     ]
     if low_prec_articles:
         print(f"  Trying infobox fallback for {len(low_prec_articles)} low-precision entries...")
-        for article in low_prec_articles:
-            infobox_date = _parse_birth_date_from_infobox(article, session)
-            if infobox_date:
-                results[article] = infobox_date
-                print(f"    Parsed birth date from infobox for '{article}': {infobox_date}")
-            time.sleep(0.3)
+        
+        def fetch_infobox(art):
+            return art, _parse_birth_date_from_infobox(art, session)
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_infobox, article) for article in low_prec_articles]
+            for future in as_completed(futures):
+                article, infobox_date = future.result()
+                if infobox_date:
+                    results[article] = infobox_date
+                    # print(f"    Parsed birth date from infobox for '{article}': {infobox_date}")
                     
     # Map back: Article -> QID -> Birth Date
     count = 0
@@ -494,6 +481,7 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     """
     Fetch the wikitext content of a Wikipedia page using the API.
     Uses a single API call to get the full page content.
+    Includes retry logic for rate limits.
     """
     url = "https://en.wikipedia.org/w/api.php"
     params = {
@@ -506,17 +494,37 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
         "formatversion": "2"
     }
     
-    response = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-    
-    pages = data.get("query", {}).get("pages", [])
-    if pages and "revisions" in pages[0]:
-        return pages[0]["revisions"][0]["slots"]["main"]["content"]
+    for attempt in range(5):
+        try:
+            response = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=30)
+            if response.status_code == 429:
+                wait = 2 * (attempt + 1)
+                print(f"  Rate limit (429) hitting for main page. Waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            
+            pages = data.get("query", {}).get("pages", [])
+            if pages and "revisions" in pages[0]:
+                return pages[0]["revisions"][0]["slots"]["main"]["content"]
+            if pages and "missing" in pages[0]:
+                print(f"  Page '{page_title}' does not exist (missing in API response).")
+                return None
+            print(f"  Unexpected API response format for '{page_title}'.")
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            print(f"  Request error for '{page_title}': {e}")
+            if attempt == 4:
+                print(f"  Failed to fetch '{page_title}' after 5 attempts.")
+                return None
+            time.sleep(1)
+            
     return None
 
 
-def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, mode: str = 'after', parent_item: Optional[str] = None, silent: bool = False) -> Optional[Dict]:
+def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, mode: str = 'after', parent_item: Optional[str] = None, silent: bool = False, defer_errors: bool = False) -> Union[Optional[Dict], Dict]:
     """
     Parse a single death entry line and return a dict or None if invalid.
     Expected format: * [[Name]], age, description  OR  * [[Name]], description (if age unknown)
@@ -528,6 +536,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     
     Args:
         parent_item: If this is a subitem, the text of the parent bullet point
+        defer_errors: If True, returns a dict with 'is_error': True instead of prompting user.
     """
     # Helper to format error/warning prefix with optional parent context
     def msg_prefix():
@@ -589,8 +598,8 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
             return nationality
         return None
     
-    def handle_error(error_msg: str, parsed_name: Optional[str] = None, parsed_description: Optional[str] = None) -> Optional[Dict]:
-        """Handle an error by prompting user for input."""
+    def handle_error(error_msg: str, parsed_name: Optional[str] = None, parsed_description: Optional[str] = None) -> Union[Optional[Dict], Dict]:
+        """Handle an error by prompting user for input, or deferring it."""
         if silent:
             return None
             
@@ -607,84 +616,32 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
                 creation_date = get_page_creation_date(parsed_name)
                 
                 if creation_date is None:
-                    print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' does not exist (skipping manual entry)")
+                    # print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' does not exist (skipping manual entry)")
                     return None
                 
                 if creation_date > start_dt:
-                     print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' created too late ({creation_date.date()} > {start_dt.date()})")
+                     # print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' created too late ({creation_date.date()} > {start_dt.date()})")
                      return None
                      
             except ValueError:
                 pass # Invalid date, let user try to fix
 
-        print(msg_prefix().format('ERROR') + error_msg)
-        print(f"  Full line: {line}")
-        if parent_item:
-            print(f"  Parent: {parent_item}")
-        
-        skip = input("  Skip this person? (y/n, Enter=n): ").strip().lower()
-        if skip == 'y':
-            return None
-        
-        # Get name from user (suggest parsed name if available)
-        if parsed_name:
-            user_name = input(f"  Enter name (press Enter to keep '{parsed_name}'): ").strip()
-            if not user_name:
-                user_name = parsed_name
-        else:
-            user_name = input("  Enter name: ").strip()
-        
-        if not user_name:
-            print("  No name provided, skipping.")
-            return None
-        
-        # Try to build description from parent item for subitems with one-word descriptions
-        suggested_description = parsed_description
-        if parsed_description and len(parsed_description.split()) == 1 and parent_item:
-            extracted = extract_nationality_from_parent(parent_item)
-            if extracted:
-                # Check if extracted is a full description (multiple words) or just nationality
-                if len(extracted.split()) > 1:
-                    # Full description like "Chinese marathon runner"
-                    suggested_description = extracted
-                else:
-                    # Just nationality, combine with parsed description
-                    suggested_description = f"{extracted} {parsed_description}"
-                confirm = input(f"  Detected description: '{suggested_description}'. Correct? (y/n, Enter=y): ").strip().lower()
-                if confirm == '' or confirm == 'y':
-                    user_description = suggested_description
-                else:
-                    user_description = input("  Enter description: ").strip()
-            else:
-                # No nationality detected, ask for description
-                if parsed_description:
-                    user_description = input(f"  Enter description (press Enter to keep '{parsed_description}'): ").strip()
-                    if not user_description:
-                        user_description = parsed_description
-                else:
-                    user_description = input("  Enter description: ").strip()
-        elif parsed_description:
-            user_description = input(f"  Enter description (press Enter to keep '{parsed_description}'): ").strip()
-            if not user_description:
-                user_description = parsed_description
-        else:
-            user_description = input("  Enter description: ").strip()
-        
-        if not user_description:
-            print("  No description provided, skipping.")
-            return None
-        
-        try:
-            death_date = datetime(year, month, current_day)
+        if defer_errors:
+            # Return error state for later resolution
             return {
-                'name': user_name,
-                'article_title': user_name,  # Use name as article title for manual entries
-                'death_date': death_date.strftime('%Y-%m-%d'),
-                'description': user_description
+                'is_error': True,
+                'raw_line': line,
+                'error_msg': error_msg,
+                'parsed_name': parsed_name,
+                'parsed_description': parsed_description,
+                'year': year,
+                'month': month,
+                'day': current_day,
+                'parent_item': parent_item,
+                'article_title': parsed_name if parsed_name else None
             }
-        except ValueError:
-            print(f"  Invalid date {year}-{month}-{current_day}, skipping.")
-            return None
+
+        return resolve_error_interactive(line, error_msg, year, month, current_day, parsed_name, parsed_description, parent_item)
 
     # Strip the leading * or ** 
     entry_text = re.sub(r'^\*+\s*', '', line)
@@ -832,11 +789,11 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         return None
 
 
-def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str = 'after', silent: bool = False) -> List[Dict]:
+def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str = 'after', silent: bool = False, defer_errors: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     Parse the wikitext to extract deaths with their dates.
     Wikipedia "Deaths in [Month] [Year]" pages have a consistent format.
-    Returns list of dicts with name, article_title, death_date, description.
+    Returns tuple: (list of valid deaths, list of pending error dicts).
     
     Handles:
     - Regular entries: * [[Name]], age, description
@@ -844,6 +801,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
     - Stops at ==References== section
     """
     deaths = []
+    pending_errors = []
     current_day = None
     errors_count = 0
     
@@ -909,9 +867,12 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
                     subitem_line = lines[i]
                     # Only process subitems that have wiki links (actual people)
                     if '[[' in subitem_line:
-                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, mode=mode, parent_item=parent_text, silent=silent)
+                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, mode=mode, parent_item=parent_text, silent=silent, defer_errors=defer_errors)
                         if death:
-                            deaths.append(death)
+                            if death.get('is_error'):
+                                pending_errors.append(death)
+                            else:
+                                deaths.append(death)
                         else:
                             errors_count += 1
                     i += 1
@@ -919,9 +880,12 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
             else:
                 # Regular entry without subitems - only process if it has a wiki link
                 if '[[' in line:
-                    death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode, silent=silent)
+                    death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode, silent=silent, defer_errors=defer_errors)
                     if death:
-                        deaths.append(death)
+                        if death.get('is_error'):
+                            pending_errors.append(death)
+                        else:
+                            deaths.append(death)
                     else:
                         errors_count += 1
                 i += 1
@@ -929,9 +893,12 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
         
         # Handle standalone subitems (** entries that aren't part of a group we already processed)
         elif line.startswith('**') and '[[' in line:
-            death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode)
+            death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode, defer_errors=defer_errors)
             if death:
-                deaths.append(death)
+                if death.get('is_error'):
+                    pending_errors.append(death)
+                else:
+                    deaths.append(death)
             else:
                 errors_count += 1
             i += 1
@@ -942,12 +909,16 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
     if errors_count > 0:
         print(f"  Encountered {errors_count} entries with format errors (skipped)")
     
-    return deaths
+    if defer_errors:
+        print(f"  Found {len(deaths)} valid deaths and {len(pending_errors)} items needing review")
+    
+    return deaths, pending_errors
 
 
-def fetch_deaths_for_month(year: int, month: int, mode: str = 'after') -> List[Dict]:
+def fetch_deaths_for_month(year: int, month: int, mode: str = 'after', defer_errors: bool = False) -> Tuple[List[Dict], List[Dict]]:
     """
     Fetch all deaths for a given month and year.
+    Returns: (valid_deaths, pending_errors)
     """
     month_names = [
         "January", "February", "March", "April", "May", "June",
@@ -962,25 +933,23 @@ def fetch_deaths_for_month(year: int, month: int, mode: str = 'after') -> List[D
     wikitext = get_wikipedia_page_content(page_title)
     if wikitext is None:
         print(f"  Could not fetch page: {page_title}")
-        return []
+        return [], []
     
-    deaths = parse_deaths_from_wikitext(wikitext, year, month, mode=mode)
-    print(f"  Found {len(deaths)} deaths")
-    
-    return deaths
+    return parse_deaths_from_wikitext(wikitext, year, month, mode=mode, defer_errors=defer_errors)
 
 
 def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output_file: str, mode: str = 'after') -> List[Dict]:
     """
     Fetch deaths for a range of dates by fetching monthly pages.
-    Exports ALL deaths with their pageview counts.
-    Writes to CSV live and supports resuming from existing file.
+    Process month-by-month to allow incremental saving and deferred prompting.
     
-    Args:
-        start_date: Start of date range
-        end_date: End of date range
-        output_file: Path to output CSV file
-        mode: 'before' or 'after'
+    Flow per month:
+    1. Fetch wikitext -> get valid deaths + pending errors.
+    2. Fetch pageviews for ALL candidates (valid + pending).
+    3. Filter out 0-view items.
+    4. Interactively resolve pending errors if they have views.
+    5. Fetch birth dates.
+    6. Save to CSV.
     """
     all_deaths = []
     completed_months: Set[Tuple[int, int]] = set()
@@ -993,11 +962,14 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             for row in reader:
                 all_deaths.append(row)
                 # Track which months are complete
-                death_date = datetime.strptime(row['death_date'], '%Y-%m-%d')
-                completed_months.add((death_date.year, death_date.month))
+                try:
+                    death_date = datetime.strptime(row['death_date'], '%Y-%m-%d')
+                    completed_months.add((death_date.year, death_date.month))
+                except ValueError:
+                    continue
         print(f"  Loaded {len(all_deaths)} existing entries")
-        print(f"  Completed months: {sorted(completed_months)}")
-    
+        print(f"  Completed months: {sorted(list(completed_months))}")
+
     # Get unique year-month combinations in the range
     months_to_fetch = set()
     current = start_date.replace(day=1)
@@ -1025,105 +997,134 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
     file_exists = os.path.exists(output_file)
     
     for i, (year, month) in enumerate(months_to_process):
-        deaths = fetch_deaths_for_month(year, month, mode=mode)
+        # 1. Fetch & Parse
+        valid_deaths, pending_errors = fetch_deaths_for_month(year, month, mode=mode, defer_errors=True)
         
-        # Group deaths by day
-        deaths_by_day = {}
-        for death in deaths:
-            death_date = datetime.strptime(death['death_date'], '%Y-%m-%d')
-            if start_date <= death_date <= end_date:
-                day_key = death['death_date']
-                if day_key not in deaths_by_day:
-                    deaths_by_day[day_key] = []
-                deaths_by_day[day_key].append(death)
-
-        # Get pageviews for all deaths in this month
-        month_deaths = []
-        if deaths_by_day:
-            # Collect all article titles + death dates for this month
-            all_article_entries = []
-            for day_deaths in deaths_by_day.values():
-                for death in day_deaths:
-                    all_article_entries.append({
-                        'article_title': death['article_title'],
-                        'death_date': datetime.strptime(death['death_date'], '%Y-%m-%d')
-                    })
-
-            # Resolve redirects so pageviews and birth dates use canonical titles
-            raw_titles = [entry['article_title'] for entry in all_article_entries]
-            redirect_map = resolve_redirects(raw_titles)
-            for entry in all_article_entries:
-                entry['article_title'] = redirect_map.get(entry['article_title'], entry['article_title'])
-            # Also update deaths_by_day so later lookups match
-            for day_deaths_list in deaths_by_day.values():
-                for death in day_deaths_list:
-                    death['article_title'] = redirect_map.get(death['article_title'], death['article_title'])
-
-            # Get pageview counts for all articles in this month (parallel requests)
-            print(f"  Fetching pageview counts ({mode} mode) for {len(all_article_entries)} articles...")
-            pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode)
-
-            # Get birth dates for all articles (strict filtering)
-            article_titles = [entry['article_title'] for entry in all_article_entries]
-            birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(article_titles)
-
-            # Add pageview count and birth date to each death record
-            # Apply STRICT FILTERING: Must have pageviews (article exists) AND full birth date
-            skipped_no_article = 0
-            skipped_no_views = 0
-            skipped_bad_date = 0
+        if not valid_deaths and not pending_errors:
+            continue
             
-            for day_key in sorted(deaths_by_day.keys()):
-                for death in deaths_by_day[day_key]:
-                    views = pageview_counts.get(death['article_title'], 0)
-                    if views == -1:
-                        # Article doesn't exist in English Wikipedia
-                        skipped_no_article += 1
-                        continue
-                    
-                    if views == 0:
-                        skipped_no_views += 1
-                        continue
-                        
-                    # 2. Check Birth Date (Strict Filtering)
-                    bdate = birth_dates_map.get(death['article_title'])
-                    if not bdate:
-                        skipped_bad_date += 1
-                        continue
-
-                    death['pageviews'] = views
-                    death['birth_date'] = bdate
-                    death.pop('article_title', None)  # Remove helper field
-                    month_deaths.append(death)
-                    all_deaths.append(death)
-            
-            if skipped_no_article > 0:
-                print(f"  Skipped {skipped_no_article} entries with no English Wikipedia article")
-            if skipped_no_views > 0:
-                print(f"  Skipped {skipped_no_views} entries with 0 pageviews")
-            if skipped_bad_date > 0:
-                print(f"  Skipped {skipped_bad_date} entries with missing/incomplete birth date")
+        combined_items = valid_deaths + pending_errors
         
-        # Write this month's deaths to CSV immediately
-        if month_deaths:
-            # Sort by date, then by pageviews (descending) within each day
-            month_deaths.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
+        # 2. Prepare for Pageviews
+        all_article_entries = []
+        for item in combined_items:
+            if item.get('article_title'):
+                try:
+                    d_date = datetime.strptime(item.get('death_date', ''), '%Y-%m-%d')
+                except ValueError:
+                    d_date = datetime(year, month, 1)
+
+                all_article_entries.append({
+                    'article_title': item['article_title'],
+                    'death_date': d_date
+                })
+
+        # 3. Fetch Pageviews (Parallel)
+        # Lowered max_workers to 10 to prevent 429 errors
+        print(f"  Fetching pageview counts ({mode} mode) for {len(all_article_entries)} articles...")
+        pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode, max_workers=10)
+        
+        # 4. Filter & Resolve
+        month_final_deaths = []
+        skipped_no_views = 0
+        skipped_user = 0
+        resolved_count = 0
+        
+        # Process Valid
+        for item in valid_deaths:
+            views = pageview_counts.get(item['article_title'], 0)
+            if views <= 0:
+                skipped_no_views += 1
+                continue
+            item['pageviews'] = views
+            month_final_deaths.append(item)
+            
+        # Process Pending
+        if pending_errors:
+            print(f"  Checking {len(pending_errors)} pending items for view counts...")
+            for item in pending_errors:
+                title = item.get('article_title')
+                views = pageview_counts.get(title, 0) if title else 0
+                
+                if views <= 0:
+                    skipped_no_views += 1
+                    continue
+                
+                # Has views -> Prompt
+                print(f"    Pending item '{item.get('parsed_name')}' has {views} views. Resolving...")
+                resolved = resolve_error_interactive(
+                    item['raw_line'], 
+                    item['error_msg'], 
+                    item['year'], 
+                    item['month'], 
+                    item['day'], 
+                    item['parsed_name'], 
+                    item['parsed_description'], 
+                    item['parent_item']
+                )
+                
+                if resolved:
+                    resolved['pageviews'] = views
+                    month_final_deaths.append(resolved)
+                    resolved_count += 1
+                else:
+                    skipped_user += 1
+        
+        if not month_final_deaths:
+            print(f"  No valid deaths found for {year}-{month} after filtering.")
+            continue
+
+        # 5. Get Birth Dates
+        titles_to_check = [d['article_title'] for d in month_final_deaths]
+        birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(titles_to_check)
+        
+        deaths_to_save = []
+        skipped_bad_date = 0
+        
+        for d in month_final_deaths:
+            bdate = birth_dates_map.get(d['article_title'])
+            if bdate:
+                d['birth_date'] = bdate
+                # Cleanup
+                d.pop('is_error', None)
+                d.pop('raw_line', None)
+                d.pop('error_msg', None)
+                d.pop('parsed_name', None)
+                d.pop('parsed_description', None)
+                d.pop('year', None)
+                d.pop('month', None)
+                d.pop('day', None)
+                d.pop('parent_item', None)
+                
+                # Check date range (should be valid by month, but good practice)
+                d_dt = datetime.strptime(d['death_date'], '%Y-%m-%d')
+                if start_date <= d_dt <= end_date:
+                    deaths_to_save.append(d)
+                    all_deaths.append(d)
+            else:
+                skipped_bad_date += 1
+        
+        if skipped_bad_date > 0:
+             print(f"  Skipped {skipped_bad_date} entries missing birth dates.")
+
+        # 6. Save
+        if deaths_to_save:
+            deaths_to_save.sort(key=lambda x: (x['death_date'], -x.get('pageviews', 0)))
             
             with open(output_file, 'a' if file_exists else 'w', newline='', encoding='utf-8') as f:
                 fieldnames = ['name', 'death_date', 'birth_date', 'description', 'pageviews']
-                # Updated fieldnames
                 writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
                 if not file_exists:
                     writer.writeheader()
                     file_exists = True
-                writer.writerows(month_deaths)
+                writer.writerows(deaths_to_save)
             
-            print(f"  Wrote {len(month_deaths)} deaths to {output_file}")
+            print(f"  Saved {len(deaths_to_save)} deaths for {year}-{month}.")
         
-        # Polite delay between requests (Wikipedia asks for no more than 1 req/sec)
+        # Delay
         if i < len(months_to_process) - 1:
-            time.sleep(1.5)
-    
+            time.sleep(1.0)
+            
     return all_deaths
 
 
