@@ -12,6 +12,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set, Tuple, Union
 import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Script version - increment this when making changes to force new output file
@@ -19,8 +20,125 @@ SCRIPT_VERSION = "1.2"
 
 # Global headers for Wikipedia API requests
 WIKI_HEADERS = {
-    "User-Agent": "CutoffDateTesting/1.0 (mailto:boasbakker123@gmail.com)"
+    "User-Agent": "CutoffDateTesting/1.0 (boasbakker123@gmail.com)"
 }
+
+# Bot credentials
+WIKI_USERNAME = "Boasbakker@CutoffDateTesting"
+WIKI_PASSWORD = "io6csmi2bvebdeb18e7dd2aojpvrlaim"
+
+# Global session object
+SESSION: Optional[requests.Session] = None
+
+
+class AdaptiveRateLimiter:
+    """
+    Adaptive rate limiter using Additive Increase / Multiplicative Decrease (AIMD).
+    Ensures gaps between requests to avoid bursts.
+    """
+    def __init__(self, initial_rate=10, max_rate=20, min_rate=1, scale_up_interval=20):
+        self.rate = initial_rate
+        self.max_rate = max_rate
+        self.min_rate = min_rate
+        self.scale_up_interval = scale_up_interval
+        
+        self.success_count = 0
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+
+    def wait(self):
+        """Wait to ensure we don't exceed the current rate."""
+        with self.lock:
+            while True:
+                now = time.time()
+                elapsed = now - self.last_request_time
+                wait_time = (1.0 / self.rate) - elapsed
+                
+                if wait_time <= 0:
+                    self.last_request_time = time.time()
+                    break
+                
+                time.sleep(wait_time)
+
+    def report_success(self):
+        """Report a successful request (not 429)."""
+        with self.lock:
+            self.success_count += 1
+            if self.success_count >= self.scale_up_interval:
+                old_rate = self.rate
+                self.rate = min(self.max_rate, self.rate + 1)
+                if self.rate > old_rate:
+                    print(f"  [RateLimiter] Scaling up: {old_rate:.1f} -> {self.rate:.1f} req/s")
+                self.success_count = 0
+
+    def report_429(self):
+        """Report a rate limit error (429)."""
+        with self.lock:
+            old_rate = self.rate
+            self.rate = max(self.min_rate, self.rate * 0.5)
+            self.success_count = 0
+            print(f"  [RateLimiter] 429 detected! Scaling down: {old_rate:.1f} -> {self.rate:.1f} req/s")
+
+
+def get_session() -> requests.Session:
+    """
+    Get or create the global requests Session.
+    Logs in if credentials are provided and session is new.
+    """
+    global SESSION
+    if SESSION is None:
+        SESSION = requests.Session()
+        SESSION.headers.update(WIKI_HEADERS)
+        
+        if WIKI_USERNAME and WIKI_PASSWORD:
+            login_to_wikipedia(SESSION)
+            
+    return SESSION
+
+
+def login_to_wikipedia(session: requests.Session):
+    """
+    Log in to Wikipedia using action=login and the provided bot credentials.
+    """
+    try:
+        print(f"Logging in as {WIKI_USERNAME}...")
+        api_url = "https://en.wikipedia.org/w/api.php"
+        
+        # 1. Get login token
+        params_token = {
+            "action": "query",
+            "meta": "tokens",
+            "type": "login",
+            "format": "json"
+        }
+        resp = session.get(api_url, params=params_token, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        login_token = data.get("query", {}).get("tokens", {}).get("logintoken")
+        
+        if not login_token:
+            print("  Failed to obtain login token.")
+            return
+
+        # 2. Log in
+        login_data = {
+            "action": "login",
+            "lgname": WIKI_USERNAME,
+            "lgpassword": WIKI_PASSWORD,
+            "lgtoken": login_token,
+            "format": "json"
+        }
+        resp = session.post(api_url, data=login_data, timeout=30)
+        resp.raise_for_status()
+        login_result = resp.json().get("login", {})
+        
+        if login_result.get("result") == "Success":
+            print(f"  Login successful!")
+        else:
+            print(f"  Login failed: {login_result.get('reason', 'Unknown reason')}")
+            
+    except Exception as e:
+        print(f"  Login error: {e}")
 
 
 def resolve_error_interactive(line: str, error_msg: str, year: int, month: int, day: int, 
@@ -75,7 +193,7 @@ def resolve_error_interactive(line: str, error_msg: str, year: int, month: int, 
         return None
 
 
-def get_page_creation_date(article_title: str) -> Optional[datetime]:
+def get_page_creation_date(article_title: str, limiter: Optional[AdaptiveRateLimiter] = None) -> Optional[datetime]:
     """
     Get the creation date of a Wikipedia article by fetching its first revision.
     Returns None if the page doesn't exist.
@@ -92,10 +210,14 @@ def get_page_creation_date(article_title: str) -> Optional[datetime]:
     }
     for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=30)
+            if limiter: limiter.wait()
+            session = get_session()
+            resp = session.get(url, params=params, timeout=30)
             if resp.status_code == 429:
+                if limiter: limiter.report_429()
                 time.sleep(2 * (attempt + 1))
                 continue
+            if limiter: limiter.report_success()
             resp.raise_for_status()
             data = resp.json()
             pages = data.get("query", {}).get("pages", {})
@@ -114,7 +236,7 @@ def get_page_creation_date(article_title: str) -> Optional[datetime]:
     return None
 
 
-def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime) -> int:
+def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime, limiter: Optional[AdaptiveRateLimiter] = None) -> int:
     """
     Low-level pageviews fetch for a single title and date range.
     Returns view count, 0 if no data, or -1 if 404.
@@ -128,13 +250,18 @@ def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime) 
     resp = None
     for attempt in range(3):
         try:
-            resp = requests.get(url, headers=WIKI_HEADERS, timeout=30)
+            if limiter: limiter.wait()
+            session = get_session()
+            resp = session.get(url, timeout=30)
             if resp.status_code == 429:
+                if limiter: limiter.report_429()
                 time.sleep(2 * (attempt + 1))
                 continue
             if resp.status_code == 404:
+                if limiter: limiter.report_success()
                 return -1
             resp.raise_for_status()
+            if limiter: limiter.report_success()
             break
         except requests.exceptions.RequestException:
             if attempt == 2:
@@ -146,7 +273,7 @@ def _fetch_pageviews_raw(safe_title: str, start_dt: datetime, end_dt: datetime) 
     return sum(item.get('views', 0) for item in data.get('items', []))
 
 
-def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'after') -> int:
+def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'after', limiter: Optional[AdaptiveRateLimiter] = None) -> int:
     """
     Get total pageviews for an article.
     mode='after': 1 day before death up to 60 days after (death incl. margin).
@@ -166,12 +293,12 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
         end_dt = death_date - timedelta(days=6)
         start_dt = end_dt - timedelta(days=60)
 
-    views = _fetch_pageviews_raw(safe_title, start_dt, end_dt)
+    views = _fetch_pageviews_raw(safe_title, start_dt, end_dt, limiter=limiter)
     if views != -1:
         return views
 
     # 404 received — check if the page actually exists and when it was created
-    creation_date = get_page_creation_date(article_title)
+    creation_date = get_page_creation_date(article_title, limiter=limiter)
     if creation_date is None:
         return -1  # Page truly doesn't exist
 
@@ -183,7 +310,7 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
     return 0
 
 
-def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 10) -> Dict[str, int]:
+def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 25) -> Dict[str, int]:
     """
     Compute pageviews for multiple articles using parallel requests.
     article_entries: list of dicts with 'article_title' and 'death_date' (datetime).
@@ -197,11 +324,13 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
     total = len(article_entries)
     completed = 0
     
+    limiter = AdaptiveRateLimiter(initial_rate=15, max_rate=20, min_rate=1)
+    
     def fetch_one(entry: Dict) -> tuple:
         title = entry['article_title']
         death_dt = entry['death_date']
-        # No artificial sleep here, rely on worker limit and retry logic in get_pageviews_sum
-        return title, get_pageviews_sum(title, death_dt, mode=mode)
+        # Rely on the internal adaptive limiter for timing
+        return title, get_pageviews_sum(title, death_dt, mode=mode, limiter=limiter)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_one, entry): entry for entry in article_entries}
@@ -216,13 +345,14 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
     return results
 
 
-def _parse_birth_date_from_infobox(article_title: str, session: requests.Session) -> Optional[str]:
+def _parse_birth_date_from_infobox(article_title: str, session: requests.Session, limiter: Optional[AdaptiveRateLimiter] = None) -> Optional[str]:
     """
     Parse a full birth date (YYYY-MM-DD) from a Wikipedia article's infobox wikitext.
     Looks for {{birth date|YYYY|M|D}} or {{Birth date and age|YYYY|M|D|...}} templates.
     Returns None if no full date is found.
     """
     try:
+        if limiter: limiter.wait()
         resp = session.get("https://en.wikipedia.org/w/api.php", params={
             "action": "query",
             "titles": article_title,
@@ -232,6 +362,10 @@ def _parse_birth_date_from_infobox(article_title: str, session: requests.Session
             "format": "json",
             "formatversion": "2"
         }, timeout=30)
+        if resp.status_code == 429:
+            if limiter: limiter.report_429()
+        else:
+            if limiter: limiter.report_success()
         resp.raise_for_status()
         data = resp.json()
         pages = data.get("query", {}).get("pages", [])
@@ -250,7 +384,7 @@ def _parse_birth_date_from_infobox(article_title: str, session: requests.Session
     return None
 
 
-def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> Tuple[Dict[str, str], Dict[str, str]]:
+def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10, limiter: Optional[AdaptiveRateLimiter] = None) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Fetch strict birth dates (YYYY-MM-DD) for a list of articles using Wikidata.
     Two-step process:
@@ -269,8 +403,8 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
     print(f"  Fetching birth dates for {len(articles)} articles from Wikidata...")
 
     # Session for connection pooling
-    session = requests.Session()
-    session.headers.update(WIKI_HEADERS)
+    session = get_session()
+    # session.headers.update(WIKI_HEADERS) # Already set in get_session
     
     # Step 1: Get QIDs in chunks of 50
     article_to_qid = {}
@@ -291,10 +425,13 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
         success = False
         for attempt in range(3):
             try:
+                if limiter: limiter.wait()
                 resp = session.get(url, params=params, timeout=30)
                 if resp.status_code == 429:
+                    if limiter: limiter.report_429()
                     time.sleep(2 * (attempt + 1))
                     continue
+                if limiter: limiter.report_success()
                 resp.raise_for_status()
                 data = resp.json()
                 success = True
@@ -365,10 +502,13 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
         success = False
         for attempt in range(3):
             try:
+                if limiter: limiter.wait()
                 resp = session.get(url, params=params, timeout=30)
                 if resp.status_code == 429:
+                    if limiter: limiter.report_429()
                     time.sleep(2 * (attempt + 1))
                     continue
+                if limiter: limiter.report_success()
                 resp.raise_for_status()
                 data = resp.json()
                 success = True
@@ -440,7 +580,7 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
         print(f"  Trying infobox fallback for {len(low_prec_articles)} low-precision entries...")
         
         def fetch_infobox(art):
-            return art, _parse_birth_date_from_infobox(art, session)
+            return art, _parse_birth_date_from_infobox(art, session, limiter=limiter)
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(fetch_infobox, article) for article in low_prec_articles]
@@ -477,7 +617,7 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
     return results, skip_reasons
 
 
-def get_wikipedia_page_content(page_title: str) -> Optional[str]:
+def get_wikipedia_page_content(page_title: str, limiter: Optional[AdaptiveRateLimiter] = None) -> Optional[str]:
     """
     Fetch the wikitext content of a Wikipedia page using the API.
     Uses a single API call to get the full page content.
@@ -496,12 +636,16 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     
     for attempt in range(5):
         try:
-            response = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=30)
+            if limiter: limiter.wait()
+            session = get_session()
+            response = session.get(url, params=params, timeout=30)
             if response.status_code == 429:
+                if limiter: limiter.report_429()
                 wait = 2 * (attempt + 1)
                 print(f"  Rate limit (429) hitting for main page. Waiting {wait}s...")
                 time.sleep(wait)
                 continue
+            if limiter: limiter.report_success()
             response.raise_for_status()
             data = response.json()
             
@@ -915,7 +1059,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str =
     return deaths, pending_errors
 
 
-def fetch_deaths_for_month(year: int, month: int, mode: str = 'after', defer_errors: bool = False) -> Tuple[List[Dict], List[Dict]]:
+def fetch_deaths_for_month(year: int, month: int, mode: str = 'after', defer_errors: bool = False, limiter: Optional[AdaptiveRateLimiter] = None) -> Tuple[List[Dict], List[Dict]]:
     """
     Fetch all deaths for a given month and year.
     Returns: (valid_deaths, pending_errors)
@@ -930,7 +1074,7 @@ def fetch_deaths_for_month(year: int, month: int, mode: str = 'after', defer_err
     
     print(f"Fetching: {page_title}")
     
-    wikitext = get_wikipedia_page_content(page_title)
+    wikitext = get_wikipedia_page_content(page_title, limiter=limiter)
     if wikitext is None:
         print(f"  Could not fetch page: {page_title}")
         return [], []
@@ -997,8 +1141,12 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
     file_exists = os.path.exists(output_file)
     
     for i, (year, month) in enumerate(months_to_process):
+        # 0. Initialize Limiter for the whole run if not already present
+        # (Though we mostly care about it within each month's pageview chunk)
+        limiter = AdaptiveRateLimiter(initial_rate=15, max_rate=20, min_rate=1)
+
         # 1. Fetch & Parse
-        valid_deaths, pending_errors = fetch_deaths_for_month(year, month, mode=mode, defer_errors=True)
+        valid_deaths, pending_errors = fetch_deaths_for_month(year, month, mode=mode, defer_errors=True, limiter=limiter)
         
         if not valid_deaths and not pending_errors:
             continue
@@ -1076,7 +1224,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
 
         # 5. Get Birth Dates
         titles_to_check = [d['article_title'] for d in month_final_deaths]
-        birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(titles_to_check)
+        birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(titles_to_check, limiter=limiter)
         
         deaths_to_save = []
         skipped_bad_date = 0
@@ -1192,6 +1340,9 @@ def main():
     args = parser.parse_args()
     
     print(f"Script version: {SCRIPT_VERSION}")
+    
+    # Initialize session and log in if configured
+    get_session()
     
     # REGULAR MODE: Fetch from Wikipedia
     try:
