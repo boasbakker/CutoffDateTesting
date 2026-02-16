@@ -47,18 +47,21 @@ class AdaptiveRateLimiter:
         self.lock = threading.Lock()
 
     def wait(self):
-        """Wait to ensure we don't exceed the current rate."""
+        """Calculates wait time and sleeps outside the lock to avoid blocking other threads."""
         with self.lock:
-            while True:
-                now = time.time()
-                elapsed = now - self.last_request_time
-                wait_time = (1.0 / self.rate) - elapsed
-                
-                if wait_time <= 0:
-                    self.last_request_time = time.time()
-                    break
-                
-                time.sleep(wait_time)
+            now = time.time()
+            # Ensure we don't start requests more often than 1/rate
+            target_time = self.last_request_time + (1.0 / self.rate)
+            sleep_time = target_time - now
+            
+            if sleep_time <= 0:
+                self.last_request_time = now
+                return
+            
+            # Reserve this time slot
+            self.last_request_time = target_time
+            
+        time.sleep(sleep_time)
 
     def report_success(self):
         """Report a successful request (not 429)."""
@@ -338,8 +341,8 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
             title, views = future.result()
             results[title] = views
             completed += 1
-            if completed % 10 == 0 or completed == total:
-                print(f"    Pageviews: {completed}/{total}", end="\r")
+            if completed % 5 == 0 or completed == total:
+                print(f"    Pageviews: {completed}/{total} (Current rate: {limiter.rate:.1f} req/s)   ", end="\r")
     
     print()  # finish line
     return results
