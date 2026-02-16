@@ -37,7 +37,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `fetch_deaths_wikipedia.py` | ~830 | Fetches deaths from Wikipedia API, parses wikitext, gets pageviews (with redirect resolution and page-creation-date fallback for 404s), exports to CSV |
+| `fetch_deaths_wikipedia.py` | ~800 | Fetches deaths from Wikipedia API, parses wikitext, gets pageviews (with redirect resolution and page-creation-date fallback for 404s) using OAuth 2 authentication, exports to CSV |
 | `query_llm.py` | ~150 | Entry point to query LLMs. Selects provider and executes tests. |
 | `config.py` | ~50 | Global configuration constants (API keys, prompts, tokens). |
 | `llm_providers.py` | ~300 | LLM Provider implementations (OpenAI, Claude, Gemini). |
