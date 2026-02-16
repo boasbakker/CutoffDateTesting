@@ -194,13 +194,9 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
     if creation_date is None:
         return -1  # Page truly doesn't exist
 
-    if creation_date > end_dt:
-        # Page was created after the counting period ends
-        return 0
-
     if creation_date > start_dt:
-        # Page was created during the counting period — re-fetch from creation date
-        return _fetch_pageviews_raw(safe_title, creation_date, end_dt)
+        # Page was created after the counting period starts -> strict ignore
+        return 0
 
     # Page existed before the period but API still returned 404 (unusual)
     return 0
@@ -520,7 +516,7 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     return None
 
 
-def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, parent_item: Optional[str] = None, silent: bool = False) -> Optional[Dict]:
+def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, mode: str = 'after', parent_item: Optional[str] = None, silent: bool = False) -> Optional[Dict]:
     """
     Parse a single death entry line and return a dict or None if invalid.
     Expected format: * [[Name]], age, description  OR  * [[Name]], description (if age unknown)
@@ -598,6 +594,29 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         if silent:
             return None
             
+        # Optimization: Pre-check if page exists/is valid for our period before asking user
+        if parsed_name:
+            try:
+                death_dt = datetime(year, month, current_day)
+                if mode == 'after':
+                    start_dt = death_dt - timedelta(days=1)
+                else:  # mode == 'before'
+                    end_dt = death_dt - timedelta(days=6)
+                    start_dt = end_dt - timedelta(days=60)
+                
+                creation_date = get_page_creation_date(parsed_name)
+                
+                if creation_date is None:
+                    print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' does not exist (skipping manual entry)")
+                    return None
+                
+                if creation_date > start_dt:
+                     print(msg_prefix().format('SKIP') + f"Page '{parsed_name}' created too late ({creation_date.date()} > {start_dt.date()})")
+                     return None
+                     
+            except ValueError:
+                pass # Invalid date, let user try to fix
+
         print(msg_prefix().format('ERROR') + error_msg)
         print(f"  Full line: {line}")
         if parent_item:
@@ -798,7 +817,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     # Description should not be just punctuation or special characters
     if description and re.match(r'^[\s\-:;,\.]+$', description):
         if not silent:
-             return handle_error(f"Description is just punctuation for '{name}': '{description}'", name, description)
+            return handle_error(f"Description is just punctuation for '{name}': '{description}'", name, description)
     
     try:
         death_date = datetime(year, month, current_day)
@@ -813,7 +832,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         return None
 
 
-def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: bool = False) -> List[Dict]:
+def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, mode: str = 'after', silent: bool = False) -> List[Dict]:
     """
     Parse the wikitext to extract deaths with their dates.
     Wikipedia "Deaths in [Month] [Year]" pages have a consistent format.
@@ -890,7 +909,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: boo
                     subitem_line = lines[i]
                     # Only process subitems that have wiki links (actual people)
                     if '[[' in subitem_line:
-                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, parent_item=parent_text, silent=silent)
+                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, mode=mode, parent_item=parent_text, silent=silent)
                         if death:
                             deaths.append(death)
                         else:
@@ -900,7 +919,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: boo
             else:
                 # Regular entry without subitems - only process if it has a wiki link
                 if '[[' in line:
-                    death = parse_death_entry(line, year, month, current_day, i + 1, silent=silent)
+                    death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode, silent=silent)
                     if death:
                         deaths.append(death)
                     else:
@@ -910,7 +929,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: boo
         
         # Handle standalone subitems (** entries that aren't part of a group we already processed)
         elif line.startswith('**') and '[[' in line:
-            death = parse_death_entry(line, year, month, current_day, i + 1)
+            death = parse_death_entry(line, year, month, current_day, i + 1, mode=mode)
             if death:
                 deaths.append(death)
             else:
@@ -926,7 +945,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: boo
     return deaths
 
 
-def fetch_deaths_for_month(year: int, month: int) -> List[Dict]:
+def fetch_deaths_for_month(year: int, month: int, mode: str = 'after') -> List[Dict]:
     """
     Fetch all deaths for a given month and year.
     """
@@ -945,7 +964,7 @@ def fetch_deaths_for_month(year: int, month: int) -> List[Dict]:
         print(f"  Could not fetch page: {page_title}")
         return []
     
-    deaths = parse_deaths_from_wikitext(wikitext, year, month)
+    deaths = parse_deaths_from_wikitext(wikitext, year, month, mode=mode)
     print(f"  Found {len(deaths)} deaths")
     
     return deaths
@@ -1006,7 +1025,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
     file_exists = os.path.exists(output_file)
     
     for i, (year, month) in enumerate(months_to_process):
-        deaths = fetch_deaths_for_month(year, month)
+        deaths = fetch_deaths_for_month(year, month, mode=mode)
         
         # Group deaths by day
         deaths_by_day = {}
@@ -1117,160 +1136,7 @@ def get_versioned_output_filename(base_output: str, mode: str) -> str:
     return f"{base}_{mode}_v{SCRIPT_VERSION}{ext}"
 
 
-def process_existing_file(input_file: str, output_file: str, mode: str = 'after'):
-    """
-    Read an existing CSV file, update pageviews and birth dates, and save to a new file.
-    Preserves existing columns and adds/updates 'birth_date' and 'pageviews'.
-    Supports incremental saving and resuming.
-    """
-    print(f"Processing existing file: {input_file}")
-    
-    if not os.path.exists(input_file):
-        print(f"Error: Input file '{input_file}' not found.")
-        return
 
-    # Read all input entries
-    input_entries = []
-    with open(input_file, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames) # Copy fieldnames
-        for row in reader:
-            input_entries.append(row)
-            
-    # Ensure new columns are in fieldnames
-    if 'birth_date' not in fieldnames:
-         fieldnames.append('birth_date')
-    if 'pageviews' not in fieldnames:
-         fieldnames.append('pageviews')
-
-    print(f"Loaded {len(input_entries)} entries from input.")
-    
-    # Check for existing output to resume
-    processed_count = 0
-    processed_keys = set()
-    file_exists = os.path.exists(output_file)
-    
-    if file_exists:
-        with open(output_file, 'r', newline='', encoding='utf-8') as f:
-            # Check if file is empty
-            f.seek(0, 2) # Go to end
-            if f.tell() > 0:
-                f.seek(0)
-                try:
-                    out_reader = csv.DictReader(f)
-                    for row in out_reader:
-                        # Use name + death_date as unique key
-                        key = (row.get('name'), row.get('death_date'))
-                        processed_keys.add(key)
-                        processed_count += 1
-                except ValueError:
-                    # File might be corrupted or just header
-                    pass
-    
-    print(f"Found {processed_count} already processed entries. Resuming...")
-    
-    # Filter entries to process
-    entries_to_process = []
-    for entry in input_entries:
-        key = (entry.get('name'), entry.get('death_date'))
-        if key not in processed_keys:
-            entries_to_process.append(entry)
-            
-    if not entries_to_process:
-        print("All entries already processed!")
-        return
-
-    print(f"Remaining entries to process: {len(entries_to_process)}")
-    
-    # Process in batches
-    BATCH_SIZE = 50
-    total_processed = 0
-    total_skipped = 0
-    
-    # Open output file in append mode
-    # If file didn't exist, DictWriter will just write, but we need to handle header manually if not exists
-    mode_flag = 'a' if file_exists else 'w'
-    with open(output_file, mode_flag, newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-        if not file_exists:
-            writer.writeheader()
-            
-        for i in range(0, len(entries_to_process), BATCH_SIZE):
-            batch = entries_to_process[i:i+BATCH_SIZE]
-            
-            # Prepare article entries for this batch
-            article_batch = []
-            valid_batch_indices = [] # Track which input items correspond to valid articles
-            
-            for idx, entry in enumerate(batch):
-                 title = entry.get('article_title') or entry.get('name')
-                 try:
-                    death_date = datetime.strptime(entry.get('death_date', ''), '%Y-%m-%d')
-                    article_batch.append({
-                        'article_title': title,
-                        'death_date': death_date,
-                        'original_entry': entry
-                    })
-                    valid_batch_indices.append(idx)
-                 except ValueError:
-                    print(f"  Skipping entry {entry.get('name')}: Invalid date")
-                    total_skipped += 1
-            
-            if not article_batch:
-                continue
-                
-            # Fetch data for batch
-            print(f"  Processing batch {i//BATCH_SIZE + 1} ({len(article_batch)} items)...")
-
-            # 0. Resolve redirects so all lookups use canonical titles
-            raw_titles = [e['article_title'] for e in article_batch]
-            redirect_map = resolve_redirects(raw_titles)
-            for item in article_batch:
-                item['article_title'] = redirect_map.get(item['article_title'], item['article_title'])
-            
-            # 1. Pageviews
-            pageview_counts = get_pageviews_for_articles(article_batch, mode=mode)
-            
-            # 2. Birth Dates
-            titles = [e['article_title'] for e in article_batch]
-            birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(titles)
-            
-            # Update and write
-            batch_to_write = []
-            for item in article_batch:
-                original = item['original_entry']
-                title = item['article_title']
-                
-                views = pageview_counts.get(title, 0)
-                bdate = birth_dates_map.get(title)
-                
-                if views == -1:
-                    print(f"    Skipping '{title}': Page not found on Wikipedia")
-                    total_skipped += 1
-                    continue
-                
-                if views == 0:
-                    print(f"    Skipping '{title}': 0 pageviews")
-                    total_skipped += 1
-                    continue
-                    
-                if not bdate:
-                    reason = birth_skip_reasons.get(title, 'Birth date not found')
-                    print(f"    Skipping '{title}': {reason}")
-                    total_skipped += 1
-                    continue
-                    
-                original['pageviews'] = views
-                original['birth_date'] = bdate
-                batch_to_write.append(original)
-            
-            if batch_to_write:
-                writer.writerows(batch_to_write)
-                f.flush() # Ensure written to disk
-                total_processed += len(batch_to_write)
-                print(f"    Saved {len(batch_to_write)} entries.")
-    
-    print(f"Done. Processed {total_processed}, Skipped {total_skipped}.")
 
 
 def save_to_csv(deaths: List[Dict], output_file: str):
@@ -1293,126 +1159,6 @@ def save_to_csv(deaths: List[Dict], output_file: str):
     print(f"\nSaved {len(deaths)} deaths to {output_file}")
 
 
-def add_article_titles(input_file: str):
-    """
-    Read a CSV file, resolve each 'name' to its canonical Wikipedia article title,
-    and add/update the 'article_title' column in-place.
-    
-    Strategy:
-    1. Group entries by Month/Year.
-    2. Fetch "Deaths in [Month] [Year]" for each group (one request per month).
-    3. Parse the page to find the exact link target for each person.
-    4. Update the CSV.
-    """
-    print(f"Adding article titles to: {input_file}")
-    
-    if not os.path.exists(input_file):
-        print(f"Error: Input file '{input_file}' not found.")
-        return
-    
-    # Read all entries
-    entries = []
-    with open(input_file, 'r', newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames)
-        for row in reader:
-            entries.append(row)
-    
-    # Add article_title column if not present
-    if 'article_title' not in fieldnames:
-        fieldnames.append('article_title')
-    
-    print(f"  Loaded {len(entries)} entries.")
-    
-    # Group entries by (year, month)
-    entries_by_month = {}
-    entries_without_date = []
-    
-    for entry in entries:
-        existing = entry.get('article_title', '').strip()
-        if existing and existing != 'NOT_FOUND':
-             # Skip if already has a valid title (allow overwriting NOT_FOUND/DISAMBIGUATION if we find better)
-             if existing != 'DISAMBIGUATION':
-                 continue
-
-        date_str = entry.get('death_date', '')
-        try:
-            dt = datetime.strptime(date_str, '%Y-%m-%d')
-            key = (dt.year, dt.month)
-            if key not in entries_by_month:
-                entries_by_month[key] = []
-            entries_by_month[key].append(entry)
-        except ValueError:
-            entries_without_date.append(entry)
-    
-    if not entries_by_month and not entries_without_date:
-        print("  All entries already have article titles!")
-        return
-
-    print(f"  Processing {len(entries_by_month)} months of data...")
-    
-    # Process each month
-    resolved_count = 0
-    not_found_count = 0
-    
-    for (year, month), month_entries in entries_by_month.items():
-        month_name = datetime(year, month, 1).strftime('%B')
-        page_title = f"Deaths in {month_name} {year}"
-        print(f"  Fetching '{page_title}' for {len(month_entries)} entries...")
-        
-        wikitext = get_wikipedia_page_content(page_title)
-        if not wikitext:
-            print(f"    Error: Could not fetch page '{page_title}'")
-            # Fallback handling later?
-            continue
-            
-        # Parse the page to get all deaths
-        parsed_deaths = parse_deaths_from_wikitext(wikitext, year, month, silent=True)
-        
-        # Build lookup: normalize(name) -> article_title
-        # We use a normalized key to match CSV names to Wikipedia display names
-        name_map = {}
-        for d in parsed_deaths:
-            # Key 1: Exact name as shown in the link text
-            name_map[d['name'].lower()] = d['article_title']
-            
-            # Key 2: The article title itself (if different)
-            name_map[d['article_title'].lower()] = d['article_title']
-            
-            # Key 3: If name is "Name (description)", mapped to "Name"
-            # (e.g. CSV has "Dick Scott", Wikipedia has "Dick Scott")
-            
-        # Match CSV entries against parsed deaths
-        for entry in month_entries:
-            csv_name = entry.get('name', '').strip()
-            if not csv_name:
-                continue
-                
-            # Try to find match
-            lower_name = csv_name.lower()
-            
-            # 1. Exact match (case-insensitive)
-            if lower_name in name_map:
-                entry['article_title'] = name_map[lower_name]
-                resolved_count += 1
-            else:
-                entry['article_title'] = 'NOT_FOUND'
-                not_found_count += 1
-                # print(f"    NOT FOUND in daily list: '{csv_name}'")
-
-    # Handle entries without valid dates (try direct lookup logic as fallback? or just skip)
-    if entries_without_date:
-        print(f"  Skipping {len(entries_without_date)} entries with invalid dates.")
-
-    # Write back in-place
-    with open(input_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-        writer.writeheader()
-        writer.writerows(entries)
-    
-    print(f"\nDone. Resolved: {resolved_count}, Not found: {not_found_count}")
-    print(f"  Note: 'NOT_FOUND' entries might be spelled differently in the CSV than on Wikipedia.")
-
 def main():
     parser = argparse.ArgumentParser(
         description='Fetch notable deaths from Wikipedia for a date range.'
@@ -1422,11 +1168,6 @@ def main():
         type=str, 
         default='2020-01-01',
         help='Start date in YYYY-MM-DD format (default: 2020-01-01)'
-    )
-    parser.add_argument(
-        '--input',
-        type=str,
-        help='Input CSV file to update (edit mode). If provided, fetching from Wikipedia is skipped.'
     )
     parser.add_argument(
         '--end', 
@@ -1447,35 +1188,10 @@ def main():
         default='before',
         help='Pageview counting mode: "after" (60 days starting 1 day before death) or "before" (default, 60 days ending 6 days before death)'
     )
-    parser.add_argument(
-        '--add-titles',
-        type=str,
-        metavar='CSV_FILE',
-        help='Add article_title column to a CSV file by resolving names to Wikipedia article titles. Flags disambiguation pages for manual correction.'
-    )
     args = parser.parse_args()
     
     print(f"Script version: {SCRIPT_VERSION}")
     
-    # ADD-TITLES MODE: Resolve names to Wikipedia article titles
-    if args.add_titles:
-        add_article_titles(args.add_titles)
-        return
-    
-    print(f"Mode: {args.mode.upper()}")
-    
-    # EDIT MODE: Process existing file
-    if args.input:
-        if args.output == 'deaths_data.csv':
-             # Default output name based on input
-             base, ext = os.path.splitext(args.input)
-             output_file = f"{base}_updated_{args.mode}{ext}"
-        else:
-             output_file = args.output
-             
-        process_existing_file(args.input, output_file, mode=args.mode)
-        return
-
     # REGULAR MODE: Fetch from Wikipedia
     try:
         start_date = datetime.strptime(args.start, '%Y-%m-%d')
