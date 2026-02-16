@@ -91,7 +91,10 @@ def save_results(results: List[Dict], output_file: str):
         return
     
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        fieldnames = ['name', 'death_date', 'description', 'pageviews', 'llm_knows_death', 'llm_response']
+        fieldnames = [
+            'name', 'article_title', 'death_date', 'birth_date', 
+            'description', 'pageviews', 'llm_knows_death', 'llm_response'
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
         writer.writeheader()
         writer.writerows(results)
