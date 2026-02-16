@@ -101,7 +101,12 @@ class OpenAIProvider(LLMProvider):
         super().__init__(model, debug)
         self.client = OpenAI() # Uses OPENAI_API_KEY environment variable
 
-    def check_death_knowledge(self, name: str, description: str, max_tokens: int, reasoning_effort: str, temperature: float) -> Tuple[bool, str]:
+    def _is_reasoning_model(self, model_name: str) -> bool:
+        """Check if the model is a reasoning model (o1, o3, gpt-5)."""
+        m = model_name.lower()
+        return 'o1' in m or 'o3' in m or 'gpt-5' in m
+
+    def check_death_knowledge(self, name: str, description: str, max_tokens: int, reasoning_effort: Optional[str], temperature: float) -> Tuple[bool, str]:
         """
         Ask the LLM if a person has died.
         """
@@ -114,17 +119,16 @@ class OpenAIProvider(LLMProvider):
 
         while True:
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
+                params = {
+                    "model": self.model,
+                    "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    max_completion_tokens=current_max_tokens,
-                    temperature=temperature,
-                    service_tier="flex",
-                    reasoning_effort=reasoning_effort,
-                    response_format={
+                    "max_completion_tokens": current_max_tokens,
+                    "temperature": temperature,
+                    "service_tier": "flex",
+                    "response_format": {
                         "type": "json_schema",
                         "json_schema": {
                             "name": "alive_check",
@@ -132,7 +136,11 @@ class OpenAIProvider(LLMProvider):
                             "schema": config.STRUCTURED_SCHEMA
                         }
                     }
-                )
+                }
+                if reasoning_effort:
+                    params["reasoning_effort"] = reasoning_effort
+
+                response = self.client.chat.completions.create(**params)
                 
                 self.debug_print(f"Full response object: {response}")
                 
@@ -172,8 +180,12 @@ class OpenAIProvider(LLMProvider):
         had_error = False
         
         max_tokens = config.MAX_TOKENS_LOW_REASONING if reasoning else config.MAX_TOKENS_OPENAI
-        reasoning_effort = "low" if reasoning else "none"
-        temperature = 1 if reasoning else config.TEMPERATURE
+        
+        temperature = config.TEMPERATURE
+        if self._is_reasoning_model(self.model):
+            reasoning_effort = "low" if reasoning else "minimal"
+        else:
+            reasoning_effort = None
         system_prompt = config.SYSTEM_PROMPT_REASONING if reasoning else config.SYSTEM_PROMPT
         
         if self.debug:
