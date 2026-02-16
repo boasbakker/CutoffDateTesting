@@ -125,9 +125,8 @@ class OpenAIProvider(LLMProvider):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    "max_completion_tokens": current_max_tokens,
+                    "max_tokens": current_max_tokens,
                     "temperature": temperature,
-                    "service_tier": "flex",
                     "response_format": {
                         "type": "json_schema",
                         "json_schema": {
