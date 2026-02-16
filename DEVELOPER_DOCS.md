@@ -122,6 +122,11 @@ python process_results_monthly.py --input results/<file>.csv [--min-samples <N>]
 - No longer uses probing; assumes model supports requested features
 - Results matched by `key` field in JSONL for reliable ordering
 
+## Performance Optimizations
+- **High Concurrency**: The script uses a `ThreadPoolExecutor` with 30 workers for pageview fetching and parallelized chunking for Wikidata requests.
+- **Batching**: Wikidata requests (QIDs and Claims) are processed in parallel batches of 50.
+- **Minimal Latency**: Artificial delays have been removed, relying on OAuth 2's robust rate limits and standard retry logic.
+
 ## Results CSV Format
 
 | Column | Type | Description |

@@ -265,7 +265,7 @@ def get_pageviews_sum(article_title: str, death_date: datetime, mode: str = 'aft
     return 0
 
 
-def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 25) -> Dict[str, int]:
+def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after', max_workers: int = 30) -> Dict[str, int]:
     """
     Compute pageviews for multiple articles using parallel requests.
     article_entries: list of dicts with 'article_title' and 'death_date' (datetime).
@@ -357,9 +357,10 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
     # Step 1: Get QIDs in chunks of 50
     article_to_qid = {}
     chunk_size = 50
+    chunks = [articles[i:i+chunk_size] for i in range(0, len(articles), chunk_size)]
     
-    for i in range(0, len(articles), chunk_size):
-        chunk = articles[i:i+chunk_size]
+    def fetch_qid_chunk(chunk):
+        local_article_to_qid = {}
         url = "https://en.wikipedia.org/w/api.php"
         params = {
             "action": "query",
@@ -386,43 +387,36 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
                     print(f"    Error fetching QIDs for chunk: {e}")
                 time.sleep(1)
         
-        if not success:
-            continue
+        if success:
+            pages = data.get("query", {}).get("pages", {})
+            redirect_map = {}
+            if "query" in data:
+                if "redirects" in data["query"]:
+                    for r in data["query"]["redirects"]:
+                        redirect_map[r["to"]] = r["from"]
+                if "normalized" in data["query"]:
+                    for n in data["query"]["normalized"]:
+                        redirect_map[n["to"]] = n["from"]
             
-        # Parse data...
-        pages = data.get("query", {}).get("pages", {})
-        
-        # Create a map of normalized/redirected titles to QIDs
-        redirect_map = {}
-        if "query" in data:
-            if "redirects" in data["query"]:
-                for r in data["query"]["redirects"]:
-                    redirect_map[r["to"]] = r["from"]
-            if "normalized" in data["query"]:
-                for n in data["query"]["normalized"]:
-                    redirect_map[n["to"]] = n["from"]
-        
-        for page_id, page in pages.items():
-            if "missing" in page or "pageprops" not in page:
-                continue
-                
-            title = page.get("title")
-            qid = page.get("pageprops", {}).get("wikibase_item")
-            
-            if not qid:
-                continue
-            
-            # 1. Direct match
-            if title in chunk:
-                article_to_qid[title] = qid
-            # 2. Mapped match (redirect target -> original)
-            elif title in redirect_map:
-                original = redirect_map[title]
-                if original in chunk:
-                        article_to_qid[original] = qid
-        
-        # Polite delay between chunks
-        time.sleep(0.5)
+            for page_id, page in pages.items():
+                if "missing" in page or "pageprops" not in page:
+                    continue
+                title = page.get("title")
+                qid = page.get("pageprops", {}).get("wikibase_item")
+                if not qid:
+                    continue
+                if title in chunk:
+                    local_article_to_qid[title] = qid
+                elif title in redirect_map:
+                    original = redirect_map[title]
+                    if original in chunk:
+                        local_article_to_qid[original] = qid
+        return local_article_to_qid
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        qid_results = list(executor.map(fetch_qid_chunk, chunks))
+        for res in qid_results:
+            article_to_qid.update(res)
             
     # Step 2: Get Birth Dates and P31 (instance-of) from Wikidata
     results = {}
@@ -433,8 +427,12 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
     disambig_qids = set()  # QIDs that are disambiguation pages
     DISAMBIG_TYPES = {"Q4167410", "Q22808320"}  # Wikimedia disambiguation page types
     
-    for i in range(0, len(qids), chunk_size):
-        chunk_qids = qids[i:i+chunk_size]
+    qid_chunks = [qids[i:i+chunk_size] for i in range(0, len(qids), chunk_size)]
+    
+    def fetch_claims_chunk(chunk_qids):
+        local_qid_to_birth = {}
+        local_qid_to_low = {}
+        local_disambig = set()
         url = "https://www.wikidata.org/w/api.php"
         params = {
             "action": "wbgetentities",
@@ -460,58 +458,51 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
                     print(f"    Error fetching Wikidata claims for chunk: {e}")
                 time.sleep(1)
 
-        if not success:
-            continue
-            
-        entities = data.get("entities", {})
-        for qid, entity in entities.items():
-            if "claims" not in entity:
-                continue
-            
-            # Check if this is a disambiguation page (P31 includes Q4167410 or Q22808320)
-            p31_claims = entity["claims"].get("P31", [])
-            for p31 in p31_claims:
-                p31_val = p31.get("mainsnak", {}).get("datavalue", {}).get("value", {})
-                if isinstance(p31_val, dict) and p31_val.get("id") in DISAMBIG_TYPES:
-                    disambig_qids.add(qid)
-                    break
-            
-            if qid in disambig_qids:
-                continue  # Skip birth date extraction for disambiguation pages
-            
-            # P569: Date of Birth
-            birth_claims = entity["claims"].get("P569", [])
-            if not birth_claims:
-                continue
-            
-            for claim in birth_claims:
-                mainsnak = claim.get("mainsnak", {})
-                datavalue = mainsnak.get("datavalue", {})
-                if not datavalue: continue
+        if success:
+            entities = data.get("entities", {})
+            for qid, entity in entities.items():
+                if "claims" not in entity:
+                    continue
                 
-                value = datavalue.get("value", {})
-                if not isinstance(value, dict): continue
-                
-                # Precision: 11 = day
-                precision = value.get("precision", 0)
-                time_str = value.get("time", "")
-                
-                if precision >= 11 and time_str:
-                    # Format is typically "+1946-06-14T00:00:00Z"
-                    if time_str.startswith('+'):
-                        clean_time = time_str[1:]
-                    else:
-                        clean_time = time_str
-                        
-                    # Extract first 10 chars: YYYY-MM-DD
-                    if len(clean_time) >= 10:
-                        birth_date = clean_time[:10]
-                        qid_to_birthdate[qid] = birth_date
+                p31_claims = entity["claims"].get("P31", [])
+                for p31 in p31_claims:
+                    p31_val = p31.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                    if isinstance(p31_val, dict) and p31_val.get("id") in DISAMBIG_TYPES:
+                        local_disambig.add(qid)
                         break
-                elif time_str:
-                    # Low precision - record for potential infobox fallback
-                    qid_to_low_precision[qid] = precision
-                    break
+                
+                if qid in local_disambig:
+                    continue
+                
+                birth_claims = entity["claims"].get("P569", [])
+                if not birth_claims:
+                    continue
+                
+                for claim in birth_claims:
+                    mainsnak = claim.get("mainsnak", {})
+                    datavalue = mainsnak.get("datavalue", {})
+                    if not datavalue: continue
+                    value = datavalue.get("value", {})
+                    if not isinstance(value, dict): continue
+                    precision = value.get("precision", 0)
+                    time_str = value.get("time", "")
+                    
+                    if precision >= 11 and time_str:
+                        clean_time = time_str[1:] if time_str.startswith('+') else time_str
+                        if len(clean_time) >= 10:
+                            local_qid_to_birth[qid] = clean_time[:10]
+                            break
+                    elif time_str:
+                        local_qid_to_low[qid] = precision
+                        break
+        return local_qid_to_birth, local_qid_to_low, local_disambig
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        claim_results = list(executor.map(fetch_claims_chunk, qid_chunks))
+        for b, l, d in claim_results:
+            qid_to_birthdate.update(b)
+            qid_to_low_precision.update(l)
+            disambig_qids.update(d)
     
     # Step 2b: Infobox fallback for low-precision Wikidata entries
     low_prec_articles = [
@@ -1105,9 +1096,9 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
                 })
 
         # 3. Fetch Pageviews (Parallel)
-        # Lowered max_workers to 10 to prevent 429 errors
+        # Increased max_workers to 30 for speed
         print(f"  Fetching pageview counts ({mode} mode) for {len(all_article_entries)} articles...")
-        pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode, max_workers=10)
+        pageview_counts = get_pageviews_for_articles(all_article_entries, mode=mode, max_workers=30)
         
         # 4. Filter & Resolve
         month_final_deaths = []
@@ -1206,9 +1197,7 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             
             print(f"  Saved {len(deaths_to_save)} deaths for {year}-{month}.")
         
-        # Delay
-        if i < len(months_to_process) - 1:
-            time.sleep(1.0)
+        # No artificial delay between months needed with OAuth 2
             
     return all_deaths
 
