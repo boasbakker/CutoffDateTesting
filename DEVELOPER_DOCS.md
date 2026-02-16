@@ -6,6 +6,7 @@ This project tests LLM knowledge cutoff dates by querying whether deceased peopl
 
 ## Core User Requirements
 
+- Only record birth year for people with a clear birth year, so month and day must also be known
 - Fetch death records from Wikipedia with pageview data
 - Query multiple LLM providers (OpenAI, Claude, Gemini) about whether the person is still alive
 - Use structured outputs (JSON with boolean `answer` field) to force deterministic Yes/No answers (native or fallback)

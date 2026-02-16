@@ -238,21 +238,58 @@ def get_pageviews_for_articles(article_entries: List[Dict], mode: str = 'after',
     return results
 
 
-def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> Dict[str, str]:
+def _parse_birth_date_from_infobox(article_title: str, session: requests.Session) -> Optional[str]:
+    """
+    Parse a full birth date (YYYY-MM-DD) from a Wikipedia article's infobox wikitext.
+    Looks for {{birth date|YYYY|M|D}} or {{Birth date and age|YYYY|M|D|...}} templates.
+    Returns None if no full date is found.
+    """
+    try:
+        resp = session.get("https://en.wikipedia.org/w/api.php", params={
+            "action": "query",
+            "titles": article_title,
+            "prop": "revisions",
+            "rvprop": "content",
+            "rvslots": "main",
+            "format": "json",
+            "formatversion": "2"
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        pages = data.get("query", {}).get("pages", [])
+        if not pages or "missing" in pages[0]:
+            return None
+        content = pages[0].get("revisions", [{}])[0].get("slots", {}).get("main", {}).get("content", "")
+    except Exception:
+        return None
+
+    # Match {{birth date|YYYY|M|D...}} or {{Birth date and age|YYYY|M|D...}}
+    pattern = r'\{\{[Bb]irth[\s_]date(?:[\s_]and[\s_]age)?\|(\d{4})\|(\d{1,2})\|(\d{1,2})'
+    match = re.search(pattern, content)
+    if match:
+        year, month, day = match.group(1), match.group(2).zfill(2), match.group(3).zfill(2)
+        return f"{year}-{month}-{day}"
+    return None
+
+
+def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
     Fetch strict birth dates (YYYY-MM-DD) for a list of articles using Wikidata.
     Two-step process:
     1. Wikipedia API: Get Wikidata QID for each article (handles redirects).
     2. Wikidata API: Get 'Date of Birth' (P569) for each QID.
+       - If precision < 11, fall back to parsing the Wikipedia infobox.
+    3. Return results and per-article skip reasons for failures.
     
-    Returns mapping: article_title -> birth_date_string (YYYY-MM-DD)
-    Only includes entries where a FULL birth date is found.
+    Returns tuple: (birth_dates, skip_reasons)
+    - birth_dates: article_title -> birth_date_string (YYYY-MM-DD)
+    - skip_reasons: article_title -> reason string (for articles without a birth date)
     """
     if not articles:
-        return {}
+        return {}, {}
         
     print(f"  Fetching birth dates for {len(articles)} articles from Wikidata...")
-    
+
     # Session for connection pooling
     session = requests.Session()
     session.headers.update(WIKI_HEADERS)
@@ -327,10 +364,14 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
         # Polite delay between chunks
         time.sleep(0.5)
             
-    # Step 2: Get Birth Dates from Wikidata for collected QIDs
+    # Step 2: Get Birth Dates and P31 (instance-of) from Wikidata
     results = {}
+    skip_reasons = {}
     qids = list(set(article_to_qid.values()))
     qid_to_birthdate = {}
+    qid_to_low_precision = {}  # QIDs with P569 but precision < 11
+    disambig_qids = set()  # QIDs that are disambiguation pages
+    DISAMBIG_TYPES = {"Q4167410", "Q22808320"}  # Wikimedia disambiguation page types
     
     for i in range(0, len(qids), chunk_size):
         chunk_qids = qids[i:i+chunk_size]
@@ -367,6 +408,17 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
             if "claims" not in entity:
                 continue
             
+            # Check if this is a disambiguation page (P31 includes Q4167410 or Q22808320)
+            p31_claims = entity["claims"].get("P31", [])
+            for p31 in p31_claims:
+                p31_val = p31.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                if isinstance(p31_val, dict) and p31_val.get("id") in DISAMBIG_TYPES:
+                    disambig_qids.add(qid)
+                    break
+            
+            if qid in disambig_qids:
+                continue  # Skip birth date extraction for disambiguation pages
+            
             # P569: Date of Birth
             birth_claims = entity["claims"].get("P569", [])
             if not birth_claims:
@@ -395,17 +447,51 @@ def get_birth_dates_for_articles(articles: List[str], max_workers: int = 10) -> 
                     if len(clean_time) >= 10:
                         birth_date = clean_time[:10]
                         qid_to_birthdate[qid] = birth_date
-                        break 
-                            
+                        break
+                elif time_str:
+                    # Low precision - record for potential infobox fallback
+                    qid_to_low_precision[qid] = precision
+                    break
+    
+    # Step 2b: Infobox fallback for low-precision Wikidata entries
+    low_prec_articles = [
+        a for a, q in article_to_qid.items() 
+        if q not in qid_to_birthdate and q in qid_to_low_precision
+    ]
+    if low_prec_articles:
+        print(f"  Trying infobox fallback for {len(low_prec_articles)} low-precision entries...")
+        for article in low_prec_articles:
+            infobox_date = _parse_birth_date_from_infobox(article, session)
+            if infobox_date:
+                results[article] = infobox_date
+                print(f"    Parsed birth date from infobox for '{article}': {infobox_date}")
+            time.sleep(0.3)
+                    
     # Map back: Article -> QID -> Birth Date
     count = 0
     for article, qid in article_to_qid.items():
+        if article in results:
+            count += 1  # Already found via infobox fallback
+            continue
         if qid in qid_to_birthdate:
             results[article] = qid_to_birthdate[qid]
             count += 1
+        else:
+            # Determine specific skip reason
+            if qid in disambig_qids:
+                skip_reasons[article] = "Disambiguation page — use --add-titles to set correct article_title"
+            elif qid in qid_to_low_precision:
+                skip_reasons[article] = f"Birth date precision too low (Wikidata precision={qid_to_low_precision[qid]}, need day-level)"
+            else:
+                skip_reasons[article] = "No birth date found on Wikidata"
+    
+    # Also record skip reasons for articles that didn't get a QID at all
+    for article in articles:
+        if article not in results and article not in skip_reasons:
+            skip_reasons[article] = "No Wikidata entry found"
             
     print(f"  Found full birth dates for {count}/{len(articles)} articles")
-    return results
+    return results, skip_reasons
 
 
 def get_wikipedia_page_content(page_title: str) -> Optional[str]:
@@ -434,7 +520,7 @@ def get_wikipedia_page_content(page_title: str) -> Optional[str]:
     return None
 
 
-def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, parent_item: Optional[str] = None) -> Optional[Dict]:
+def parse_death_entry(line: str, year: int, month: int, current_day: int, line_num: int, parent_item: Optional[str] = None, silent: bool = False) -> Optional[Dict]:
     """
     Parse a single death entry line and return a dict or None if invalid.
     Expected format: * [[Name]], age, description  OR  * [[Name]], description (if age unknown)
@@ -509,6 +595,9 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     
     def handle_error(error_msg: str, parsed_name: Optional[str] = None, parsed_description: Optional[str] = None) -> Optional[Dict]:
         """Handle an error by prompting user for input."""
+        if silent:
+            return None
+            
         print(msg_prefix().format('ERROR') + error_msg)
         print(f"  Full line: {line}")
         if parent_item:
@@ -671,37 +760,45 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
     
     # Sanity check: name should look like a person's name (not too short, not a generic term)
     if len(name) < 2:
+        if silent: return None
         return handle_error(f"Name too short: '{name}'", name, description)
     
     # Two letter names are allowed if they are a capital letter followed by a lowercase letter
     if len(name) == 2:
         if re.match(r'^[A-Z][a-z]$', name):
-            print(msg_prefix().format('WARNING') + f"Name is only 2 characters: '{name}'")
+            if not silent:
+                 print(msg_prefix().format('WARNING') + f"Name is only 2 characters: '{name}'")
         else:
+            if silent: return None
             return handle_error(f"Invalid 2-character name (must be capital + lowercase): '{name}'", name, description)
     
     # Warn if name is just one word (most people have first and last name)
     if len(name.split()) == 1:
-        print(msg_prefix().format('WARNING') + f"Name is only one word: '{name}'")
+        if not silent:
+             print(msg_prefix().format('WARNING') + f"Name is only one word: '{name}'")
     
     # Now validate description
     
     # Must have content after the name (age and/or description)
     if not after_name.strip() or after_name.strip() == ',':
-        return handle_error(f"No content after name: {name}", name, description)
+        if not silent: # In silent mode, accept it if we have a name
+             return handle_error(f"No content after name: {name}", name, description)
     
     # Sanity check: description must be longer than 3 characters
     if not description or len(description) <= 3:
-        return handle_error(f"Description too short for '{name}': '{description}'", name, description)
+        if not silent:
+            return handle_error(f"Description too short for '{name}': '{description}'", name, description)
     
     # Description must have at least 2 words
-    words = description.split()
+    words = description.split() if description else []
     if len(words) == 1:
-        return handle_error(f"Description is only one word for '{name}': '{description}'", name, description)
+        if not silent:
+            return handle_error(f"Description is only one word for '{name}': '{description}'", name, description)
     
     # Description should not be just punctuation or special characters
-    if re.match(r'^[\s\-:;,\.]+$', description):
-        return handle_error(f"Description is just punctuation for '{name}': '{description}'", name, description)
+    if description and re.match(r'^[\s\-:;,\.]+$', description):
+        if not silent:
+             return handle_error(f"Description is just punctuation for '{name}': '{description}'", name, description)
     
     try:
         death_date = datetime(year, month, current_day)
@@ -716,7 +813,7 @@ def parse_death_entry(line: str, year: int, month: int, current_day: int, line_n
         return None
 
 
-def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dict]:
+def parse_deaths_from_wikitext(wikitext: str, year: int, month: int, silent: bool = False) -> List[Dict]:
     """
     Parse the wikitext to extract deaths with their dates.
     Wikipedia "Deaths in [Month] [Year]" pages have a consistent format.
@@ -793,7 +890,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dic
                     subitem_line = lines[i]
                     # Only process subitems that have wiki links (actual people)
                     if '[[' in subitem_line:
-                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, parent_item=parent_text)
+                        death = parse_death_entry(subitem_line, year, month, current_day, i + 1, parent_item=parent_text, silent=silent)
                         if death:
                             deaths.append(death)
                         else:
@@ -803,7 +900,7 @@ def parse_deaths_from_wikitext(wikitext: str, year: int, month: int) -> List[Dic
             else:
                 # Regular entry without subitems - only process if it has a wiki link
                 if '[[' in line:
-                    death = parse_death_entry(line, year, month, current_day, i + 1)
+                    death = parse_death_entry(line, year, month, current_day, i + 1, silent=silent)
                     if death:
                         deaths.append(death)
                     else:
@@ -949,11 +1046,12 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
 
             # Get birth dates for all articles (strict filtering)
             article_titles = [entry['article_title'] for entry in all_article_entries]
-            birth_dates_map = get_birth_dates_for_articles(article_titles)
+            birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(article_titles)
 
             # Add pageview count and birth date to each death record
             # Apply STRICT FILTERING: Must have pageviews (article exists) AND full birth date
             skipped_no_article = 0
+            skipped_no_views = 0
             skipped_bad_date = 0
             
             for day_key in sorted(deaths_by_day.keys()):
@@ -962,6 +1060,10 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
                     if views == -1:
                         # Article doesn't exist in English Wikipedia
                         skipped_no_article += 1
+                        continue
+                    
+                    if views == 0:
+                        skipped_no_views += 1
                         continue
                         
                     # 2. Check Birth Date (Strict Filtering)
@@ -978,6 +1080,8 @@ def fetch_deaths_for_date_range(start_date: datetime, end_date: datetime, output
             
             if skipped_no_article > 0:
                 print(f"  Skipped {skipped_no_article} entries with no English Wikipedia article")
+            if skipped_no_views > 0:
+                print(f"  Skipped {skipped_no_views} entries with 0 pageviews")
             if skipped_bad_date > 0:
                 print(f"  Skipped {skipped_bad_date} entries with missing/incomplete birth date")
         
@@ -1129,7 +1233,7 @@ def process_existing_file(input_file: str, output_file: str, mode: str = 'after'
             
             # 2. Birth Dates
             titles = [e['article_title'] for e in article_batch]
-            birth_dates_map = get_birth_dates_for_articles(titles)
+            birth_dates_map, birth_skip_reasons = get_birth_dates_for_articles(titles)
             
             # Update and write
             batch_to_write = []
@@ -1137,21 +1241,22 @@ def process_existing_file(input_file: str, output_file: str, mode: str = 'after'
                 original = item['original_entry']
                 title = item['article_title']
                 
-                # Update info (allow partials, or keep strict?)
-                # User asked for edit mode to update fields. 
-                # If strict, we skip rows that fail. If lenient, we write what we have.
-                # Previous implementation was strict. Stick to strict for now to avoid bad data.
-                
                 views = pageview_counts.get(title, 0)
                 bdate = birth_dates_map.get(title)
                 
                 if views == -1:
-                    print(f"    Skipping '{title}': Page not found")
+                    print(f"    Skipping '{title}': Page not found on Wikipedia")
+                    total_skipped += 1
+                    continue
+                
+                if views == 0:
+                    print(f"    Skipping '{title}': 0 pageviews")
                     total_skipped += 1
                     continue
                     
                 if not bdate:
-                    print(f"    Skipping '{title}': Birth date not found")
+                    reason = birth_skip_reasons.get(title, 'Birth date not found')
+                    print(f"    Skipping '{title}': {reason}")
                     total_skipped += 1
                     continue
                     
@@ -1188,6 +1293,126 @@ def save_to_csv(deaths: List[Dict], output_file: str):
     print(f"\nSaved {len(deaths)} deaths to {output_file}")
 
 
+def add_article_titles(input_file: str):
+    """
+    Read a CSV file, resolve each 'name' to its canonical Wikipedia article title,
+    and add/update the 'article_title' column in-place.
+    
+    Strategy:
+    1. Group entries by Month/Year.
+    2. Fetch "Deaths in [Month] [Year]" for each group (one request per month).
+    3. Parse the page to find the exact link target for each person.
+    4. Update the CSV.
+    """
+    print(f"Adding article titles to: {input_file}")
+    
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' not found.")
+        return
+    
+    # Read all entries
+    entries = []
+    with open(input_file, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames)
+        for row in reader:
+            entries.append(row)
+    
+    # Add article_title column if not present
+    if 'article_title' not in fieldnames:
+        fieldnames.append('article_title')
+    
+    print(f"  Loaded {len(entries)} entries.")
+    
+    # Group entries by (year, month)
+    entries_by_month = {}
+    entries_without_date = []
+    
+    for entry in entries:
+        existing = entry.get('article_title', '').strip()
+        if existing and existing != 'NOT_FOUND':
+             # Skip if already has a valid title (allow overwriting NOT_FOUND/DISAMBIGUATION if we find better)
+             if existing != 'DISAMBIGUATION':
+                 continue
+
+        date_str = entry.get('death_date', '')
+        try:
+            dt = datetime.strptime(date_str, '%Y-%m-%d')
+            key = (dt.year, dt.month)
+            if key not in entries_by_month:
+                entries_by_month[key] = []
+            entries_by_month[key].append(entry)
+        except ValueError:
+            entries_without_date.append(entry)
+    
+    if not entries_by_month and not entries_without_date:
+        print("  All entries already have article titles!")
+        return
+
+    print(f"  Processing {len(entries_by_month)} months of data...")
+    
+    # Process each month
+    resolved_count = 0
+    not_found_count = 0
+    
+    for (year, month), month_entries in entries_by_month.items():
+        month_name = datetime(year, month, 1).strftime('%B')
+        page_title = f"Deaths in {month_name} {year}"
+        print(f"  Fetching '{page_title}' for {len(month_entries)} entries...")
+        
+        wikitext = get_wikipedia_page_content(page_title)
+        if not wikitext:
+            print(f"    Error: Could not fetch page '{page_title}'")
+            # Fallback handling later?
+            continue
+            
+        # Parse the page to get all deaths
+        parsed_deaths = parse_deaths_from_wikitext(wikitext, year, month, silent=True)
+        
+        # Build lookup: normalize(name) -> article_title
+        # We use a normalized key to match CSV names to Wikipedia display names
+        name_map = {}
+        for d in parsed_deaths:
+            # Key 1: Exact name as shown in the link text
+            name_map[d['name'].lower()] = d['article_title']
+            
+            # Key 2: The article title itself (if different)
+            name_map[d['article_title'].lower()] = d['article_title']
+            
+            # Key 3: If name is "Name (description)", mapped to "Name"
+            # (e.g. CSV has "Dick Scott", Wikipedia has "Dick Scott")
+            
+        # Match CSV entries against parsed deaths
+        for entry in month_entries:
+            csv_name = entry.get('name', '').strip()
+            if not csv_name:
+                continue
+                
+            # Try to find match
+            lower_name = csv_name.lower()
+            
+            # 1. Exact match (case-insensitive)
+            if lower_name in name_map:
+                entry['article_title'] = name_map[lower_name]
+                resolved_count += 1
+            else:
+                entry['article_title'] = 'NOT_FOUND'
+                not_found_count += 1
+                # print(f"    NOT FOUND in daily list: '{csv_name}'")
+
+    # Handle entries without valid dates (try direct lookup logic as fallback? or just skip)
+    if entries_without_date:
+        print(f"  Skipping {len(entries_without_date)} entries with invalid dates.")
+
+    # Write back in-place
+    with open(input_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        writer.writerows(entries)
+    
+    print(f"\nDone. Resolved: {resolved_count}, Not found: {not_found_count}")
+    print(f"  Note: 'NOT_FOUND' entries might be spelled differently in the CSV than on Wikipedia.")
+
 def main():
     parser = argparse.ArgumentParser(
         description='Fetch notable deaths from Wikipedia for a date range.'
@@ -1222,9 +1447,21 @@ def main():
         default='before',
         help='Pageview counting mode: "after" (60 days starting 1 day before death) or "before" (default, 60 days ending 6 days before death)'
     )
+    parser.add_argument(
+        '--add-titles',
+        type=str,
+        metavar='CSV_FILE',
+        help='Add article_title column to a CSV file by resolving names to Wikipedia article titles. Flags disambiguation pages for manual correction.'
+    )
     args = parser.parse_args()
     
     print(f"Script version: {SCRIPT_VERSION}")
+    
+    # ADD-TITLES MODE: Resolve names to Wikipedia article titles
+    if args.add_titles:
+        add_article_titles(args.add_titles)
+        return
+    
     print(f"Mode: {args.mode.upper()}")
     
     # EDIT MODE: Process existing file
