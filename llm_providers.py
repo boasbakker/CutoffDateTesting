@@ -446,9 +446,9 @@ class GeminiBatchProvider(LLMProvider):
             print(f"  prompt_template: {config.PROMPT_TEMPLATE}")
             print("=" * 60 + "\n")
         
-        jsonl_file_path = tempfile.mktemp(suffix='.jsonl', prefix='gemini_batch_')
-        
-        with open(jsonl_file_path, 'w', encoding='utf-8') as f:
+        # Create a temporary JSONL file
+        with tempfile.NamedTemporaryFile(suffix='.jsonl', prefix='gemini_batch_', delete=False, mode='w', encoding='utf-8') as tmp_file:
+            jsonl_file_path = tmp_file.name
             for i, death in enumerate(deaths):
                 prompt = config.PROMPT_TEMPLATE.format(name=death['name'], description=death.get('description', ''))
                 request_obj = {
@@ -470,7 +470,7 @@ class GeminiBatchProvider(LLMProvider):
                 if thinking_level is not None:
                     gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level.upper()}
                 request_obj["request"]["generationConfig"] = gen_cfg
-                f.write(json.dumps(request_obj) + '\n')
+                tmp_file.write(json.dumps(request_obj) + '\n')
                 if i == 0:
                     self.debug_print(f"Sample request (first): {request_obj}")
         
@@ -479,7 +479,7 @@ class GeminiBatchProvider(LLMProvider):
         print("Uploading batch request file...")
         uploaded_file = self.client.files.upload(
             file=jsonl_file_path,
-            config={'display_name': f'cutoff-test-{self.model}', 'mime_type': 'application/jsonl'}
+            config={'display_name': f'cutoff-test-{self.model}', 'mime_type': 'text/plain'}
         )
         print(f"Uploaded file: {uploaded_file.name}")
         

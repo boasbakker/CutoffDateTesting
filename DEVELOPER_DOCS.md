@@ -119,6 +119,7 @@ python process_results_monthly.py --input results/<file>.csv [--min-samples <N>]
 ### Gemini (Batch API with File-Based Input)
 - Uses JSONL file upload → batch job → file download for results
 - **Always uses structured outputs** via `responseMimeType: "application/json"` + `responseJsonSchema`
+- **MIME Type Workaround**: Uses `mime_type: "text/plain"` for file uploads to avoid a known `400 INVALID_ARGUMENT` bug with `application/jsonl`.
 - No longer uses probing; assumes model supports requested features
 - Results matched by `key` field in JSONL for reliable ordering
 
