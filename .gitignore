@@ -18,3 +18,5 @@ reproduce_batch_order_bug.py
 random_pattern.txt
 openai_model_cache.json
 google_model_cache.json
+
+ideas.md
