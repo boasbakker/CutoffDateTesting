@@ -127,6 +127,7 @@ class OpenAIProvider(LLMProvider):
                     ],
                     "max_tokens": current_max_tokens,
                     "temperature": temperature,
+                    "service_tier": "flex",
                     "response_format": {
                         "type": "json_schema",
                         "json_schema": {

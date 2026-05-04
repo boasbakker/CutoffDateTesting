@@ -1,0 +1,6 @@
+Gemini 3.1 Pro nadenken over death
+Low: 169 tokens
+Medium: 131 tokens
+High: 182, 229 tokens
+
+In alle gevallen: soms ook gewoon 0

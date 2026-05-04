@@ -11,7 +11,10 @@ This project tests LLM knowledge cutoff dates by querying whether deceased peopl
 - Query multiple LLM providers (OpenAI, Claude, Gemini) about whether the person is still alive
 - Use structured outputs (JSON with boolean `answer` field) to force deterministic Yes/No answers (native or fallback)
 - Support batch APIs for Claude and Gemini, sequential/flex for OpenAI
-- Support reasoning/thinking modes for all providers (simplified prompt strategy)
+- **Support 2026 Models & Reasoning:**
+  - **OpenAI:** Support `gpt-5`, `o1`, `o3`. Control `reasoning_effort` (`minimal`, `low`, etc.).
+  - **Claude:** Support `claude-3.7`, `claude-4.6`. Control extended `thinking` (`budget_tokens`, `adaptive`).
+  - **Gemini:** Support `gemini-3`. Control `thinking_config` (`thinking_level`, `thinking_budget`).
 - Filter deaths by pageviews (top per day/month, minimum views)
 - Export results to CSV for analysis
 - Generate accuracy-over-time plots and statistics
@@ -39,11 +42,11 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 |------|-------|---------|
 | `fetch_deaths_wikipedia.py` | ~800 | Fetches deaths from Wikipedia API, parses wikitext, gets pageviews (with redirect resolution and page-creation-date fallback for 404s) using OAuth 2 authentication, exports to CSV |
 | `query_llm.py` | ~150 | Entry point to query LLMs. Selects provider and executes tests. |
-| `config.py` | ~50 | Global configuration constants (API keys, prompts, tokens). |
-| `llm_providers.py` | ~300 | LLM Provider implementations (OpenAI, Claude, Gemini). |
+| `config.py` | ~60 | Global configuration constants (API keys, prompts, tokens, reasoning levels). |
+| `llm_providers.py` | ~350 | LLM Provider implementations (OpenAI, Claude, Gemini) with 2026 model support. |
 | `process_results.py` | ~454 | Generates accuracy statistics by date/month/pageviews, produces plots |
 | `process_results_monthly.py` | ~270 | Monthly accuracy analysis with trend lines, cleaner axis labels |
-| `select_model.py` | ~270 | Interactive model selector: provider → series → level → version via single-keypress input. Importable (`from select_model import select_model`) or standalone. |
+| `select_model.py` | ~270 | Interactive model selector. |
 
 ### Data Files
 
@@ -71,7 +74,7 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 
 | Variable | Provider | Required for |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | OpenAI | `gpt-*` models |
+| `OPENAI_API_KEY` | OpenAI | `gpt-*`, `o*` models |
 | `ANTHROPIC_API_KEY` | Anthropic | `claude-*` models |
 | `GOOGLE_API_KEY` | Google | `gemini-*` models |
 
@@ -83,8 +86,9 @@ process_results.py / process_results_monthly.py  →  plots + statistics
 | `MAX_TOKENS_OPENAI` | 5 | Max output tokens for OpenAI |
 | `MAX_TOKENS_CLAUDE` | 2 | Max output tokens for Claude |
 | `MAX_TOKENS_GEMINI_MINIMAL` | 5 | Max output tokens for Gemini (minimal thinking) |
-| `MAX_TOKENS_LOW_REASONING` | 200 | Max tokens when reasoning is enabled |
-| `SYSTEM_PROMPT` | `"Answer 'Yes' or 'No'..."` | Standard system prompt (reasoning variant exists) |
+| `REASONING_EFFORT_MINIMAL` | "minimal" | For OpenAI GPT-5 series |
+| `REASONING_EFFORT_LOW` | "low" | For OpenAI o-series |
+| `GEMINI_THINKING_LEVEL_MINIMAL` | "MINIMAL" | For Gemini 3 series |
 
 ### CLI Usage (`query_llm.py`)
 
@@ -95,38 +99,36 @@ python query_llm.py --model <model> --start <YYYY-MM-DD> --end <YYYY-MM-DD> \
 
 **Required** (mutually exclusive): `--top-per-day <N>` or `--top-per-month <N>` (use 0 for all).
 
-### CLI Usage (`process_results_monthly.py`)
-
-```bash
-python process_results_monthly.py --input results/<file>.csv [--min-samples <N>]
-```
-
-## Provider-Specific Details
+## Provider-Specific Details (2026 Updates)
 
 ### OpenAI (Sequential/Flex)
-- Uses `client.chat.completions.create()` with `service_tier="flex"`
-- Sequential calls with configurable delay between requests
-- Structured output via `response_format` with `json_schema` and `strict: true`
-- Reasoning via `reasoning_effort` parameter; retries with higher `max_tokens` on empty responses
+- **Models:** `gpt-5`, `gpt-5.2`, `o1`, `o3`.
+- **Reasoning Controls:**
+  - **Default:** `reasoning_effort="minimal"` (GPT-5) or `"low"` (o-series).
+  - **With `--reasoning`:** `reasoning_effort="medium"`.
 
 ### Claude (Batch API)
-- Uses `client.messages.batches.create()` for batch processing
-- Structured output via `output_config.format` with `json_schema` (models ≥ 4.5)
-- **Legacy Fallback**: For older 3.x models, uses response prefilling with `{"answer":` + stop sequence `}`
-- Extended thinking via `thinking` config with `budget_tokens`
-- Uses simplified `SYSTEM_PROMPT` or `SYSTEM_PROMPT_REASONING` based on mode
+- **Models:** `claude-3.7`, `claude-4.6`.
+- **Reasoning Controls:**
+  - **Default:** Extended thinking disabled (parameter omitted).
+  - **With `--reasoning`:**
+    - Claude 4.6: `thinking={"type": "adaptive", "budget_tokens": 4096}`.
+    - Claude 3.7: `thinking={"type": "enabled", "budget_tokens": 1024}`.
 
-### Gemini (Batch API with File-Based Input)
-- Uses JSONL file upload → batch job → file download for results
-- **Always uses structured outputs** via `responseMimeType: "application/json"` + `responseJsonSchema`
-- **MIME Type Workaround**: Uses `mime_type: "text/plain"` for file uploads to avoid a known `400 INVALID_ARGUMENT` bug with `application/jsonl`.
-- No longer uses probing; assumes model supports requested features
-- Results matched by `key` field in JSONL for reliable ordering
+### Gemini (Batch API)
+- **Models:** `gemini-3`, `gemini-2.5`.
+- **Reasoning Controls:**
+  - **Default:**
+    - Gemini 3: `thinking_config={"thinking_level": "MINIMAL"}`.
+    - Gemini 2.5: `thinking_config={"thinking_budget": 0}`.
+  - **With `--reasoning`:**
+    - Gemini 3: `thinking_config={"thinking_level": "HIGH", "include_thoughts": True}`.
+    - Gemini 2.5: `thinking_config={"thinking_budget": 1024, "include_thoughts": True}`.
 
 ## Performance Optimizations
-- **High Concurrency**: The script uses a `ThreadPoolExecutor` with 30 workers for pageview fetching and parallelized chunking for Wikidata requests.
-- **Batching**: Wikidata requests (QIDs and Claims) are processed in parallel batches of 50.
-- **Minimal Latency**: Artificial delays have been removed, relying on OAuth 2's robust rate limits and standard retry logic.
+- **High Concurrency:** The script uses a `ThreadPoolExecutor` with 30 workers for pageview fetching.
+- **Batching:** Wikidata requests (QIDs and Claims) are processed in parallel batches of 50.
+- **Minimal Latency:** Artificial delays have been removed.
 
 ## Results CSV Format
 

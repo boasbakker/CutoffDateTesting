@@ -8,6 +8,8 @@
   - Dit kan ook losgekoppeld worden naar een aparte benchmark: PeopleBench, die test hoeveel personen een LLM kent. Kan uitgedrukt worden als percentage van Wikipedia. 
 - publiceren? Kijken of dit nieuwe resultaten zijn. https://malihehizadi.github.io/ Nadeel: zij focust vooral op software 
 
+GROK TESTEN
+
 > TU Delft BSc/MSc students: TU Delft students interested in LLMs and Software Engineering are welcome to join my lab for thesis projects, internships, or research. Contact me via email to schedule a meeting.
 Zij doe
 
